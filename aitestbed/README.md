@@ -256,21 +256,24 @@ The testbed captures metrics aligned with TR 22.870:
 ### Setup
 
 ```bash
-# Clone or navigate to the testbed directory
-cd aitestbed
+# Navigate to the repo root
+cd <repo-root>
 
 # Create virtual environment (recommended)
 python -m venv venv
 source venv/bin/activate
 
-# Install Python dependencies
-pip install -r requirements.txt
+# Install netemu first (separate sibling package)
+pip install -e netemu
 
-# Install MCP servers (for agent scenarios)
+# Install testbed dependencies (run from repo root)
+pip install -r aitestbed/requirements.txt
+
+# Install npm-based MCP servers (for agent scenarios)
 npm install -g @modelcontextprotocol/server-brave-search
-npm install -g @modelcontextprotocol/server-fetch
 npm install -g @modelcontextprotocol/server-filesystem
 npm install -g @modelcontextprotocol/server-memory
+# Note: the fetch MCP server is Python-based and included in requirements.txt
 ```
 
 ### API Keys
@@ -469,7 +472,7 @@ print(f"Generation time: {image_response.latency_sec:.2f}s")
 
 ```python
 # Using the network emulator
-from netem import NetworkEmulator
+from netemu import NetworkEmulator
 
 # Default: bidirectional shaping (egress + ingress)
 emulator = NetworkEmulator(
@@ -875,8 +878,8 @@ make shell
 ### Docker Commands
 
 ```bash
-# Build the Docker image
-docker build -t 6g-ai-testbed:latest .
+# Build the Docker image (from repo root)
+docker build -t 6g-ai-testbed:latest -f aitestbed/Dockerfile .
 
 # Run with environment variables
 docker run --rm \

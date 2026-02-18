@@ -1,5 +1,8 @@
 """
 Google Gemini client adapter for the 6G AI Traffic Testbed.
+
+Uses the unified google-genai SDK (replacement for the deprecated
+google-generativeai package).
 """
 
 import os
@@ -22,6 +25,8 @@ from .base import (
 class GeminiClient(LLMClient):
     """
     Google Gemini API client adapter with traffic metrics collection.
+
+    Uses the google-genai SDK (google.genai).
     """
 
     def __init__(self, api_key: Optional[str] = None):
@@ -29,64 +34,90 @@ class GeminiClient(LLMClient):
         Initialize the Gemini client.
 
         Args:
-            api_key: Google API key. If not provided, uses GOOGLE_API_KEY env var.
+            api_key: Google API key. If not provided, uses GOOGLE_API_KEY
+                     or GEMINI_API_KEY env var.
         """
         try:
-            import google.generativeai as genai
+            from google import genai
+            from google.genai import types
             self._genai = genai
+            self._types = types
         except ImportError:
             raise ImportError(
-                "google-generativeai package is required. "
-                "Install with: pip install google-generativeai"
+                "google-genai package is required. "
+                "Install with: pip install google-genai"
             )
 
-        api_key = api_key or os.environ.get("GOOGLE_API_KEY")
-        if api_key:
-            genai.configure(api_key=api_key)
-
-        self._models = {}  # Cache for model instances
+        api_key = api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        self._client = genai.Client(api_key=api_key)
 
     @property
     def provider(self) -> str:
         return "gemini"
 
-    def _get_model(self, model_name: str):
-        """Get or create a GenerativeModel instance."""
-        if model_name not in self._models:
-            self._models[model_name] = self._genai.GenerativeModel(model_name)
-        return self._models[model_name]
-
-    def _convert_messages(self, messages: list[ChatMessage]) -> list[dict]:
-        """Convert ChatMessage list to Gemini format."""
-        gemini_messages = []
+    def _convert_contents(self, messages: list[ChatMessage]) -> list[dict]:
+        """Convert ChatMessage list to Gemini contents format."""
+        contents = []
         for msg in messages:
             if msg.role == MessageRole.SYSTEM:
-                # Gemini handles system prompts differently
-                # Prepend to first user message or add as context
+                # System instructions are passed separately via config
                 continue
             elif msg.role == MessageRole.USER:
-                gemini_messages.append({
+                contents.append({
                     "role": "user",
                     "parts": [{"text": msg.content}]
                 })
             elif msg.role == MessageRole.ASSISTANT:
-                gemini_messages.append({
+                contents.append({
                     "role": "model",
                     "parts": [{"text": msg.content}]
                 })
             elif msg.role == MessageRole.TOOL:
-                # Tool responses in Gemini format
-                gemini_messages.append({
+                contents.append({
                     "role": "function",
                     "parts": [{"text": msg.content}]
                 })
-        return gemini_messages
+        return contents
 
     def _get_system_instruction(self, messages: list[ChatMessage]) -> Optional[str]:
         """Extract system instruction from messages."""
         for msg in messages:
             if msg.role == MessageRole.SYSTEM:
                 return msg.content
+        return None
+
+    def _build_config(self, system_instruction: Optional[str] = None, **kwargs):
+        """Build a GenerateContentConfig with optional system instruction."""
+        config_kwargs = {}
+        if system_instruction:
+            config_kwargs["system_instruction"] = system_instruction
+        # Pass through any supported config params
+        for key in ("temperature", "top_p", "top_k", "max_output_tokens",
+                     "stop_sequences", "candidate_count"):
+            if key in kwargs:
+                config_kwargs[key] = kwargs.pop(key)
+        if config_kwargs:
+            return self._types.GenerateContentConfig(**config_kwargs)
+        return None
+
+    def _response_to_dict(self, response) -> Optional[dict]:
+        """Safely convert a response to a dict for payload logging."""
+        if hasattr(response, "model_dump"):
+            try:
+                return response.model_dump()
+            except Exception:
+                pass
+        if hasattr(response, "to_dict"):
+            try:
+                return response.to_dict()
+            except Exception:
+                pass
+        if hasattr(response, "__dict__"):
+            try:
+                return {k: str(v) for k, v in response.__dict__.items()
+                        if not k.startswith("_")}
+            except Exception:
+                pass
         return None
 
     def chat(
@@ -113,64 +144,32 @@ class GeminiClient(LLMClient):
         **kwargs
     ) -> ChatResponse:
         """Synchronous (non-streaming) chat completion."""
-        gemini_model = self._get_model(model)
+        contents = self._convert_contents(messages)
+        system_instruction = self._get_system_instruction(messages)
+        config = self._build_config(system_instruction=system_instruction, **kwargs)
 
-        # Convert messages
-        gemini_messages = self._convert_messages(messages)
+        request_payload = {
+            "format": "genai.models.generate_content",
+            "payload": {
+                "model": model,
+                "contents": contents,
+                "system_instruction": system_instruction,
+            },
+        }
+        request_bytes = estimate_payload_bytes(request_payload["payload"])
 
         t_start = time.time()
 
-        system_instruction = self._get_system_instruction(messages)
+        generate_kwargs = {"model": model, "contents": contents}
+        if config:
+            generate_kwargs["config"] = config
 
-        # Create chat session or generate directly
-        if len(gemini_messages) == 1:
-            # Single message - use generate_content
-            prompt_text = gemini_messages[0]["parts"][0]["text"]
-            request_bytes = estimate_payload_bytes({
-                "model": model,
-                "input": prompt_text,
-                **kwargs,
-            })
-            request_payload = {
-                "format": "gemini.generate_content",
-                "payload": {
-                    "model": model,
-                    "input": prompt_text,
-                    "system_instruction": system_instruction,
-                    **kwargs,
-                },
-            }
-            response = gemini_model.generate_content(prompt_text, **kwargs)
-        else:
-            # Multi-turn - use chat
-            chat = gemini_model.start_chat(history=gemini_messages[:-1])
-            last_msg = gemini_messages[-1]["parts"][0]["text"]
-            request_bytes = estimate_payload_bytes({
-                "model": model,
-                "history": gemini_messages[:-1],
-                "message": last_msg,
-                **kwargs,
-            })
-            request_payload = {
-                "format": "gemini.chat.send_message",
-                "payload": {
-                    "model": model,
-                    "history": gemini_messages[:-1],
-                    "message": last_msg,
-                    "system_instruction": system_instruction,
-                    **kwargs,
-                },
-            }
-            response = chat.send_message(last_msg, **kwargs)
+        response = self._client.models.generate_content(**generate_kwargs)
 
         t_end = time.time()
 
         # Extract content
-        content = ""
-        if response.candidates:
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, "text"):
-                    content += part.text
+        content = response.text or ""
 
         # Parse tool calls if present
         tool_calls: list[ToolCall] = []
@@ -189,16 +188,16 @@ class GeminiClient(LLMClient):
                     arguments=args
                 ))
 
-        # Get usage metadata if available
+        # Get usage metadata
         tokens_in = None
         tokens_out = None
-        if hasattr(response, "usage_metadata"):
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
             usage = response.usage_metadata
             tokens_in = getattr(usage, "prompt_token_count", None)
             tokens_out = getattr(usage, "candidates_token_count", None)
 
         # Estimate response size
-        response_dump = response.to_dict() if hasattr(response, "to_dict") else None
+        response_dump = self._response_to_dict(response)
         if response_dump is not None:
             response_bytes = estimate_payload_bytes(response_dump)
         else:
@@ -223,7 +222,7 @@ class GeminiClient(LLMClient):
             response_bytes=response_bytes,
             request_payload=request_payload,
             response_payload={
-                "format": "gemini.response",
+                "format": "genai.response",
                 "payload": response_dump,
             },
         )
@@ -235,21 +234,15 @@ class GeminiClient(LLMClient):
         **kwargs
     ) -> Iterator[str]:
         """Generator that yields content chunks from a streaming response."""
-        gemini_model = self._get_model(model)
-        gemini_messages = self._convert_messages(messages)
+        contents = self._convert_contents(messages)
+        system_instruction = self._get_system_instruction(messages)
+        config = self._build_config(system_instruction=system_instruction, **kwargs)
 
-        if len(gemini_messages) == 1:
-            response = gemini_model.generate_content(
-                gemini_messages[0]["parts"][0]["text"],
-                stream=True,
-                **kwargs
-            )
-        else:
-            chat = gemini_model.start_chat(history=gemini_messages[:-1])
-            last_msg = gemini_messages[-1]["parts"][0]["text"]
-            response = chat.send_message(last_msg, stream=True, **kwargs)
+        generate_kwargs = {"model": model, "contents": contents}
+        if config:
+            generate_kwargs["config"] = config
 
-        for chunk in response:
+        for chunk in self._client.models.generate_content_stream(**generate_kwargs):
             if chunk.text:
                 yield chunk.text
 
@@ -262,45 +255,20 @@ class GeminiClient(LLMClient):
         """
         Send a streaming chat request and collect all chunks with timing metrics.
         """
-        gemini_model = self._get_model(model)
-        gemini_messages = self._convert_messages(messages)
+        contents = self._convert_contents(messages)
+        system_instruction = self._get_system_instruction(messages)
+        config = self._build_config(system_instruction=system_instruction, **kwargs)
 
-        if len(gemini_messages) == 1:
-            prompt_text = gemini_messages[0]["parts"][0]["text"]
-            request_bytes = estimate_payload_bytes({
+        request_payload = {
+            "format": "genai.models.generate_content_stream",
+            "payload": {
                 "model": model,
-                "input": prompt_text,
+                "contents": contents,
                 "stream": True,
-                **kwargs,
-            })
-            request_payload = {
-                "format": "gemini.generate_content",
-                "payload": {
-                    "model": model,
-                    "input": prompt_text,
-                    "stream": True,
-                    **kwargs,
-                },
-            }
-        else:
-            last_msg = gemini_messages[-1]["parts"][0]["text"]
-            request_bytes = estimate_payload_bytes({
-                "model": model,
-                "history": gemini_messages[:-1],
-                "message": last_msg,
-                "stream": True,
-                **kwargs,
-            })
-            request_payload = {
-                "format": "gemini.chat.send_message",
-                "payload": {
-                    "model": model,
-                    "history": gemini_messages[:-1],
-                    "message": last_msg,
-                    "stream": True,
-                    **kwargs,
-                },
-            }
+                "system_instruction": system_instruction,
+            },
+        }
+        request_bytes = estimate_payload_bytes(request_payload["payload"])
 
         streaming_response = StreamingResponse()
         streaming_response.t_request_start = time.time()
@@ -308,30 +276,20 @@ class GeminiClient(LLMClient):
         streaming_response.model = model
         streaming_response.request_payload = request_payload
 
-        if len(gemini_messages) == 1:
-            response = gemini_model.generate_content(
-                gemini_messages[0]["parts"][0]["text"],
-                stream=True,
-                **kwargs
-            )
-        else:
-            chat = gemini_model.start_chat(history=gemini_messages[:-1])
-            last_msg = gemini_messages[-1]["parts"][0]["text"]
-            response = chat.send_message(last_msg, stream=True, **kwargs)
+        generate_kwargs = {"model": model, "contents": contents}
+        if config:
+            generate_kwargs["config"] = config
 
-        for chunk in response:
+        for chunk in self._client.models.generate_content_stream(**generate_kwargs):
             now = time.time()
-            if hasattr(chunk, "to_dict"):
-                chunk_dump = chunk.to_dict()
-                chunk_bytes = estimate_payload_bytes(chunk_dump)
-            elif hasattr(chunk, "model_dump"):
-                chunk_dump = chunk.model_dump()
+            chunk_dump = self._response_to_dict(chunk)
+            if chunk_dump is not None:
                 chunk_bytes = estimate_payload_bytes(chunk_dump)
             else:
                 chunk_dump = str(chunk)
-                chunk_bytes = estimate_payload_bytes(str(chunk))
+                chunk_bytes = estimate_payload_bytes(chunk_dump)
             streaming_response.response_events.append({
-                "format": "gemini.stream.chunk",
+                "format": "genai.stream.chunk",
                 "timestamp": now,
                 "bytes": chunk_bytes,
                 "payload": chunk_dump,
@@ -345,7 +303,7 @@ class GeminiClient(LLMClient):
         streaming_response.tokens_in = self.estimate_message_tokens(messages, model)
         streaming_response.tokens_out = self.estimate_tokens(streaming_response.total_content, model)
         streaming_response.response_payload = {
-            "format": "gemini.response_summary",
+            "format": "genai.response_summary",
             "payload": {
                 "content": streaming_response.total_content,
                 "tokens_in": streaming_response.tokens_in,
@@ -372,8 +330,6 @@ class GeminiClient(LLMClient):
         """
         import PIL.Image
 
-        gemini_model = self._get_model(model)
-
         # Load image
         image = PIL.Image.open(image_path)
 
@@ -382,21 +338,27 @@ class GeminiClient(LLMClient):
             image_bytes = len(f.read())
         request_bytes = len(prompt.encode("utf-8")) + image_bytes
 
+        system_instruction = kwargs.pop("system_instruction", None)
+        config = self._build_config(system_instruction=system_instruction, **kwargs)
+
         t_start = time.time()
 
-        response = gemini_model.generate_content([prompt, image], **kwargs)
+        generate_kwargs = {
+            "model": model,
+            "contents": [prompt, image],
+        }
+        if config:
+            generate_kwargs["config"] = config
+
+        response = self._client.models.generate_content(**generate_kwargs)
 
         t_end = time.time()
 
-        content = ""
-        if response.candidates:
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, "text"):
-                    content += part.text
+        content = response.text or ""
 
         tokens_in = None
         tokens_out = None
-        if hasattr(response, "usage_metadata"):
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
             usage = response.usage_metadata
             tokens_in = getattr(usage, "prompt_token_count", None)
             tokens_out = getattr(usage, "candidates_token_count", None)
@@ -405,7 +367,7 @@ class GeminiClient(LLMClient):
         if tokens_out is None:
             tokens_out = self.estimate_tokens(content, model)
 
-        response_dump = response.to_dict() if hasattr(response, "to_dict") else None
+        response_dump = self._response_to_dict(response)
         response_bytes = len(content.encode("utf-8"))
         if response_dump is not None:
             response_bytes = estimate_payload_bytes(response_dump)
@@ -419,15 +381,14 @@ class GeminiClient(LLMClient):
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             request_payload={
-                "format": "gemini.generate_content",
+                "format": "genai.models.generate_content",
                 "payload": {
                     "model": model,
-                    "input": [prompt, f"image:{image_path}"],
-                    **kwargs,
+                    "contents": [prompt, f"image:{image_path}"],
                 },
             },
             response_payload={
-                "format": "gemini.response",
+                "format": "genai.response",
                 "payload": response_dump or {"content": content},
             },
         )

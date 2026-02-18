@@ -21,8 +21,10 @@ The core testing framework that orchestrates experiments across multiple AI prov
 - **SQLite logging** with structured metrics schema
 
 ```bash
+# From the repo root:
+pip install -e netemu
+pip install -r aitestbed/requirements.txt
 cd aitestbed
-pip install -r requirements.txt
 python orchestrator.py --scenario chat_basic --profile 5g_urban --runs 10
 ```
 
@@ -52,13 +54,17 @@ with NetworkEmulator(interface="eth0") as emu:
 cd testbed
 python -m venv venv
 source venv/bin/activate
+
+# Install netemu first (separate package), then testbed dependencies
+pip install -e netemu
 pip install -r aitestbed/requirements.txt
 
 # Set API keys
 export OPENAI_API_KEY="your-key"
 
 # Run a basic experiment
-python aitestbed/orchestrator.py --scenario chat_basic --profile ideal_6g --runs 5
+cd aitestbed
+python orchestrator.py --scenario chat_basic --profile ideal_6g --runs 5
 ```
 
 ## Docker

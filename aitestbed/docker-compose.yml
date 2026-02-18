@@ -10,8 +10,8 @@ version: '3.8'
 services:
   testbed:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: aitestbed/Dockerfile
     image: 6g-ai-testbed:latest
     container_name: ai-traffic-testbed
 

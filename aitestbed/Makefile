@@ -49,11 +49,11 @@ help:
 # =============================================================================
 
 build:
-	@chmod +x docker/*.sh
-	docker build -t 6g-ai-testbed:latest .
+	@chmod +x docker/*.sh 2>/dev/null || true
+	docker build -t 6g-ai-testbed:latest -f Dockerfile ..
 
 build-nocache:
-	docker build --no-cache -t 6g-ai-testbed:latest .
+	docker build --no-cache -t 6g-ai-testbed:latest -f Dockerfile ..
 
 run:
 	./docker/run.sh --help

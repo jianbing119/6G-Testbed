@@ -26,14 +26,15 @@ mcpServers:
       - brave_web_search
       - brave_local_search
 
-  # HTTP Fetch - Fetches content from URLs
+  # HTTP Fetch - Fetches content from URLs (Python-based MCP server)
   # Provides: fetch
+  # Install: pip install mcp-server-fetch  (or use uvx mcp-server-fetch)
   fetch:
     name: fetch
-    command: npx
+    command: python
     args:
-      - "-y"
-      - "@modelcontextprotocol/server-fetch"
+      - "-m"
+      - "mcp_server_fetch"
     env: {}
     description: "Fetch content from URLs with robot.txt compliance"
     tools:

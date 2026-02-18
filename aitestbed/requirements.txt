@@ -1,11 +1,15 @@
 # 6G AI Traffic Testbed Dependencies
 
-# Network Emulation (local package)
--e ../netemu
+# Network Emulation (local sibling package — install separately)
+# netemu is a standalone package in the sibling netemu/ directory.
+# Install it before installing these dependencies:
+#   cd <repo-root>
+#   pip install -e netemu
+#   pip install -r aitestbed/requirements.txt
 
 # LLM Clients
 openai>=1.0.0
-google-generativeai>=0.3.0
+google-genai>=1.0.0
 websockets>=12.0  # For OpenAI Realtime API
 
 # Data Processing
@@ -39,9 +43,11 @@ aiortc>=1.5.0
 # Optional: Computer use executor
 playwright>=1.41.0
 
-# MCP (Model Context Protocol) - Note: MCP servers are npm packages
-# Install MCP servers via npm: npm install -g @modelcontextprotocol/server-brave-search
-# The Python MCP client uses subprocess to communicate with npm-based servers
+# MCP (Model Context Protocol)
+# Some MCP servers are npm packages, others are Python packages.
+# Install npm-based servers: npm install -g @modelcontextprotocol/server-brave-search
+# The Python MCP client uses subprocess to communicate with MCP servers.
+mcp-server-fetch>=2025.0.0
 
 # Async support (included in Python 3.7+, but useful for type hints)
 # asyncio is part of stdlib

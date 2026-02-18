@@ -6,15 +6,11 @@
 # =============================================================================
 FROM node:20-slim AS node-builder
 
-# Install MCP servers globally
+# Install npm-based MCP servers (only those actually used in mcp_servers.yaml)
 RUN npm install -g \
-    @modelcontextprotocol/server-fetch \
-    @modelcontextprotocol/server-filesystem \
-    @modelcontextprotocol/server-git \
-    @modelcontextprotocol/server-memory \
-    @modelcontextprotocol/server-puppeteer \
     @modelcontextprotocol/server-brave-search \
-    @modelcontextprotocol/server-sequential-thinking \
+    @modelcontextprotocol/server-filesystem \
+    @modelcontextprotocol/server-memory \
     && npm cache clean --force
 
 # =============================================================================
@@ -85,16 +81,20 @@ RUN useradd -m -s /bin/bash testbed \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# Copy netemu package and install it first (separate package)
+# Build context must be the repo root: docker build -f aitestbed/Dockerfile .
+COPY netemu/ /tmp/netemu
+RUN pip install --no-cache-dir /tmp/netemu && rm -rf /tmp/netemu
 
-# Install Python dependencies
+# Copy requirements and install Python dependencies
+# (netemu is already installed above from the sibling directory)
+COPY aitestbed/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir playwright \
     && playwright install-deps chromium || true
 
 # Copy application code
-COPY . .
+COPY aitestbed/ .
 
 # Create necessary directories
 RUN mkdir -p \
@@ -105,9 +105,8 @@ RUN mkdir -p \
     /tmp/testbed-sandbox \
     && chown -R testbed:testbed /app /tmp/testbed-sandbox
 
-# Copy entrypoint script
-COPY docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Set up entrypoint script (already copied as part of aitestbed/)
+RUN cp docker/entrypoint.sh /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Switch to non-root user
 USER testbed

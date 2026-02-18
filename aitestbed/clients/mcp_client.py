@@ -294,8 +294,8 @@ BRAVE_SEARCH_SERVER = MCPServerConfig(
 
 FETCH_SERVER = MCPServerConfig(
     name="fetch",
-    command="npx",
-    args=["-y", "@modelcontextprotocol/server-fetch"]
+    command=sys.executable,
+    args=["-m", "mcp_server_fetch"]
 )
 
 FILESYSTEM_SERVER = MCPServerConfig(
