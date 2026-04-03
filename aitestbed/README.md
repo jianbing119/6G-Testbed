@@ -45,6 +45,10 @@ The testbed supports multiple LLM providers (OpenAI, Google Gemini, DeepSeek, se
 | Realtime Multilingual (`realtime_multilingual`) | Multilingual real-time conversation | Latency, TTFT, streaming chunks, bytes, audio bytes |
 | Realtime Audio (`realtime_audio`) | Audio-based real-time conversation (voice in/out) | Latency, TTFT, audio bytes, audio duration, streaming chunks |
 | Realtime Audio WebRTC (`realtime_audio_webrtc`) | Audio-based real-time conversation over WebRTC | Latency, TTFT, audio bytes, audio duration, streaming chunks, SDP sizes |
+| Music Search (`music_search`) | Music search agent via Spotify MCP tools | Latency, tokens, tool calls/latency, bytes |
+| Music Playlist (`music_playlist`) | Playlist composition agent via Spotify MCP tools | Latency, tokens, tool calls/latency, bytes |
+| Music Research (`music_research`) | Music research agent with Spotify + web search | Latency, tokens, tool calls/latency, bytes |
+| Music Search DeepSeek (`music_search_deepseek`) | Music search agent using DeepSeek | Latency, tokens, tool calls/latency, bytes |
 
 
 ### Network Profiles
@@ -251,7 +255,42 @@ The testbed captures metrics aligned with TR 22.870:
 - Python 3.10+
 - Node.js 18+ (for MCP servers)
 - Linux with `tc` and `netem` (for network emulation)
+- `tcpdump` (for PCAP packet capture)
 - `sudo` access (for network emulation) - see [Sudoers Configuration](#sudoers-configuration-for-network-emulation) for passwordless setup
+
+### System Packages
+
+Install the required system packages for network emulation and packet capture:
+
+```bash
+# Install tcpdump for L3/L4 packet capture (required for --capture-pcap)
+sudo apt-get install -y tcpdump
+
+# Install iproute2 for tc/netem (usually pre-installed on Linux)
+sudo apt-get install -y iproute2
+```
+
+> **Note:** Without `tcpdump` installed, the `--capture-pcap` flag will silently fail to produce pcap files. The capture controller spawns `tcpdump` as a subprocess — if the binary is missing, no error is raised but no packets are captured.
+
+### Sudoers Configuration for Network Emulation
+
+Network emulation and packet capture require `sudo` for `tc`, `tcpdump`, `modprobe`, and `ip`. To avoid password prompts during automated test runs, add a passwordless sudoers rule:
+
+```bash
+# Note: tcpdump may be at /usr/sbin/tcpdump or /usr/bin/tcpdump depending on distro
+TCPDUMP_PATH=$(which tcpdump)
+echo "$USER ALL=(ALL) NOPASSWD: /sbin/tc, $TCPDUMP_PATH, /sbin/modprobe, /sbin/ip" | sudo tee /etc/sudoers.d/testbed
+sudo chmod 440 /etc/sudoers.d/testbed
+```
+
+Verify it works:
+
+```bash
+sudo -n tc qdisc show dev lo
+sudo -n tcpdump --version
+```
+
+Both commands should complete without prompting for a password. If running inside Docker, use `--cap-add=NET_ADMIN` instead.
 
 ### Setup
 
@@ -293,6 +332,11 @@ export DEEPSEEK_API_KEY="..."
 # Required for agent scenarios (Brave Search MCP server)
 # Get your API key at: https://brave.com/search/api/
 export BRAVE_API_KEY="..."
+
+# Required for music agent scenarios (Spotify MCP server)
+# Create an app at: https://developer.spotify.com/dashboard
+export SPOTIFY_CLIENT_ID="..."
+export SPOTIFY_CLIENT_SECRET="..."
 ```
 
 ### Models and Pricing
@@ -318,6 +362,9 @@ Each scenario uses a specific model. The table below shows the mapping and estim
 | realtime_interactive | gpt-realtime-mini | realtime (text) | $0.60 in / $2.40 out |
 | realtime_technical | gpt-realtime-mini | realtime (text) | $0.60 in / $2.40 out |
 | realtime_audio | gpt-realtime-mini | realtime (audio) | $10.00 in / $20.00 out |
+| music_search | gpt-5-mini | music agent | $0.25 in / $2.00 out |
+| music_playlist | gpt-5-mini | music agent | $0.25 in / $2.00 out |
+| music_research | gpt-5-mini | music research agent | $0.25 in / $2.00 out |
 
 **DeepSeek** 
 
@@ -327,6 +374,7 @@ Each scenario uses a specific model. The table below shows the mapping and estim
 | chat_deepseek_streaming | deepseek-chat | chat | $0.14 in / $0.28 out |
 | chat_deepseek_coder | deepseek-coder | chat | $0.14 in / $0.28 out |
 | chat_deepseek_reasoner | deepseek-reasoner | chat | $0.55 in / $2.19 out |
+| music_search_deepseek | deepseek-chat | music agent | $0.14 in / $0.28 out |
 
 **Gemini** 
 
@@ -358,14 +406,66 @@ mcpServers:
   fetch:             # URL content fetching
   filesystem:        # Sandboxed file operations
   memory:            # Persistent key-value storage
+  spotify:           # Spotify music search/recommendations
 
 serverGroups:
   shopping:          # brave-search, fetch
   web_research:      # brave-search, fetch, memory
+  music:             # spotify
+  music_research:    # spotify, brave-search, fetch
   general:           # All servers
 ```
 
 The MCP client automatically starts/stops servers as needed during scenario execution.
+
+### vLLM Local Inference Server
+
+vLLM enables testing with self-hosted open-weight models, allowing measurement of pure inference time separate from network latency. The testbed uses the OpenAI-compatible API endpoint exposed by vLLM, so no client code changes are needed.
+
+#### Server Setup
+
+```bash
+# Install vLLM (requires CUDA)
+pip install vllm
+
+# Start the server with Qwen3-VL (multimodal, supports vision+text)
+vllm serve Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 1 \
+    --max-model-len 32768 \
+    --gpu-memory-utilization 0.90 \
+    --trust-remote-code
+```
+
+#### Verification
+
+```bash
+curl http://localhost:8000/v1/models
+```
+
+#### Scenarios
+
+The testbed includes two vLLM scenarios:
+
+- **`chat_vllm`** -- Streaming chat using the OpenAI-compatible endpoint, applied with `network_interface: lo` to shape loopback traffic.
+- **`video_understanding_vllm`** -- Video understanding with base64-encoded video upload (~1.85 MB per request).
+
+#### Running vLLM Scenarios
+
+```bash
+# Chat with local model
+python orchestrator.py --scenario chat_vllm --profile 5g_urban --runs 10
+
+# Video understanding (requires test video at the configured path)
+python orchestrator.py --scenario video_understanding_vllm --profile ideal_6g --runs 10
+```
+
+#### Notes
+
+- vLLM scenarios use `network_interface: lo` in the config so tc/netem shaping is applied to the loopback interface.
+- GPU memory: Qwen3-VL-30B-A3B requires ~24 GB VRAM at 90% utilization.
+- The testbed auto-detects the vLLM server; if unavailable, vLLM scenarios are skipped by `run_full_tests.sh`.
 
 ## Usage
 
@@ -400,7 +500,7 @@ python orchestrator.py \
     --config configs/scenarios.yaml \
     --profiles configs/profiles.yaml \
     --db logs/traffic_logs.db \
-    --report reports/my_experiment.json
+    --report results/reports/my_experiment.json
 ```
 
 ### Programmatic Usage
@@ -435,7 +535,7 @@ matrix_results = orchestrator.run_test_matrix(runs_per_experiment=10)
 # Generate report
 orchestrator.generate_report(
     matrix_results["metrics"],
-    "reports/experiment_report.json"
+    "results/reports/experiment_report.json"
 )
 ```
 
@@ -558,7 +658,7 @@ from clients import OpenAIClient, ChatMessage, MessageRole
 
 # Start L7 capture
 l7_capture = L7CaptureController(
-    capture_dir="capture/l7_captures",
+    capture_dir="results/l7_captures",
     proxy_port=8080,
     web_port=8081  # Web UI at http://localhost:8081
 )
@@ -710,16 +810,16 @@ SQLite database with the following schema:
 
 The testbed generates:
 
-- **JSON Summary** (`reports/experiment_report.json`)
+- **JSON Summary** (`results/reports/experiment_report.json`)
   - Raw metrics in 3GPP-compatible format
   - Per-scenario, per-profile breakdown
 
-- **Markdown Tables** (`reports/experiment_tables.md`)
+- **Markdown Tables** (`results/reports/experiment_tables.md`)
   - QoE metrics summary
   - Traffic characteristics
   - Agent/tool metrics
 
-- **Visualization Plots** (`reports/figures/`)
+- **Visualization Plots** (`results/reports/figures/`)
   - Latency comparison bar charts
   - Latency CDF plots
   - UL/DL ratio comparisons
@@ -947,15 +1047,15 @@ The compose file ships a single `testbed` service for core runs.
 Mount these volumes to preserve data between runs:
 
 ```bash
--v $(pwd)/logs:/app/logs              # SQLite logs
--v $(pwd)/reports:/app/reports        # Generated reports
--v $(pwd)/capture/captures:/app/capture/captures    # PCAP files
--v $(pwd)/capture/l7_captures:/app/capture/l7_captures  # L7 logs
+-v $(pwd)/logs:/app/logs                              # SQLite logs
+-v $(pwd)/results/reports:/app/results/reports        # Generated reports
+-v $(pwd)/results/captures:/app/results/captures      # PCAP files
+-v $(pwd)/results/l7_captures:/app/results/l7_captures  # L7 logs
 ```
 
 ## References
 
-- [3GPP TR 26.998](https://www.3gpp.org/): 6G Media Study
+- [3GPP TR 26.870](https://www.3gpp.org/): 6G Media Study
 - [3GPP TR 22.870](https://www.3gpp.org/): Service requirements for 6G
 - [OpenAI API Documentation](https://platform.openai.com/docs/api-reference)
 - [Google Gemini API Documentation](https://ai.google.dev/gemini-api/docs)

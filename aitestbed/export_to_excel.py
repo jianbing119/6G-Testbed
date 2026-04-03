@@ -56,22 +56,26 @@ def load_records(db_path: str, since_timestamp: float = None) -> list[dict]:
     else:
         cursor.execute("SELECT * FROM traffic_logs ORDER BY timestamp")
 
-    records = [dict(row) for row in cursor.fetchall()]
+    records = [
+        dict(row) for row in cursor.fetchall()
+        if not (dict(row).get("session_id") or "").startswith(("pcap_", "timeout_"))
+    ]
     conn.close()
     return records
 
 
 def fuse_latest_runs(records: list[dict], gap_sec: float = 300.0) -> list[dict]:
-    """Keep only the latest run per scenario based on timestamp gaps."""
+    """Keep only the latest run per scenario+profile based on timestamp gaps."""
     if not records:
         return []
-    by_scenario: dict[str, list[dict]] = defaultdict(list)
+    by_key: dict[str, list[dict]] = defaultdict(list)
     for record in records:
         scenario = record.get("scenario_id") or "unknown"
-        by_scenario[scenario].append(record)
+        profile = record.get("network_profile") or "unknown"
+        by_key[f"{scenario}/{profile}"].append(record)
 
     fused: list[dict] = []
-    for recs in by_scenario.values():
+    for recs in by_key.values():
         recs.sort(key=lambda r: r.get("timestamp", 0.0))
         start_idx = 0
         for i in range(len(recs) - 1, 0, -1):
@@ -397,13 +401,85 @@ def export_ttft_heatmap(records: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def export_mcp_tool_metrics(records: list[dict]) -> pd.DataFrame:
+    """Export MCP tool call metrics (agent/music scenarios)."""
+    import json
+
+    by_scenario = defaultdict(lambda: {
+        "tool_calls": 0,
+        "tool_success": 0,
+        "tool_latencies": [],
+        "tool_bytes": [],
+        "tool_names": defaultdict(int),
+        "api_calls": 0,
+    })
+    scenario_providers = scenario_provider_map(records)
+
+    for r in records:
+        scenario_id = r.get("scenario_id") or "unknown"
+        metadata_str = r.get("metadata", "")
+        try:
+            metadata = json.loads(metadata_str) if metadata_str else {}
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+
+        if metadata.get("type") == "mcp_tool_call":
+            entry = by_scenario[scenario_id]
+            entry["tool_calls"] += 1
+            if r.get("success"):
+                entry["tool_success"] += 1
+            latency = r.get("latency_sec")
+            if latency and latency > 0:
+                entry["tool_latencies"].append(latency)
+            total_bytes = (r.get("request_bytes", 0) or 0) + (r.get("response_bytes", 0) or 0)
+            if total_bytes > 0:
+                entry["tool_bytes"].append(total_bytes)
+            tool_name = metadata.get("tool_name", "unknown")
+            entry["tool_names"][tool_name] += 1
+        else:
+            # Primary LLM API call
+            by_scenario[scenario_id]["api_calls"] += 1
+
+    rows = []
+    for scenario_id in sorted(by_scenario.keys()):
+        entry = by_scenario[scenario_id]
+        if entry["tool_calls"] == 0:
+            continue
+        provider = scenario_providers.get(scenario_id, provider_alias(None))
+        latencies = entry["tool_latencies"]
+        tool_bytes = entry["tool_bytes"]
+        tool_names_str = ", ".join(
+            f"{name}({count})" for name, count in sorted(entry["tool_names"].items())
+        )
+        rows.append({
+            "Scenario": scenario_label(scenario_id, provider),
+            "Provider": provider,
+            "API_Calls": entry["api_calls"],
+            "Tool_Calls": entry["tool_calls"],
+            "Tool_Success": entry["tool_success"],
+            "Tool_Failure": entry["tool_calls"] - entry["tool_success"],
+            "Tool_Success_Rate_Pct": (entry["tool_success"] / entry["tool_calls"]) * 100 if entry["tool_calls"] > 0 else 0,
+            "Agent_Loop_Factor": entry["tool_calls"] / max(entry["api_calls"], 1),
+            "Mean_Tool_Latency_sec": sum(latencies) / len(latencies) if latencies else 0,
+            "Max_Tool_Latency_sec": max(latencies) if latencies else 0,
+            "Mean_Tool_Bytes": sum(tool_bytes) / len(tool_bytes) if tool_bytes else 0,
+            "Total_Tool_Bytes": sum(tool_bytes),
+            "Tools_Used": tool_names_str,
+        })
+
+    return pd.DataFrame(rows)
+
+
 def export_protocol_comparison(records: list[dict]) -> pd.DataFrame:
     """Export protocol comparison data."""
+    import json
+
     protocols = {
         "REST": [],
         "REST_Streaming": [],
         "WebSocket": [],
         "WebRTC": [],
+        "MCP_Agent": [],
     }
 
     for r in records:
@@ -412,7 +488,16 @@ def export_protocol_comparison(records: list[dict]) -> pd.DataFrame:
         if not latency or latency <= 0:
             continue
 
-        if "webrtc" in scenario.lower():
+        # Check metadata for MCP tool calls
+        metadata_str = r.get("metadata", "")
+        try:
+            metadata = json.loads(metadata_str) if metadata_str else {}
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+
+        if metadata.get("type") == "mcp_tool_call":
+            protocols["MCP_Agent"].append(latency)
+        elif "webrtc" in scenario.lower():
             protocols["WebRTC"].append(latency)
         elif "realtime" in scenario.lower():
             protocols["WebSocket"].append(latency)
@@ -495,7 +580,7 @@ def main():
     parser.add_argument("--since-timestamp", type=float, help="Filter by timestamp")
     parser.add_argument("--all-runs", action="store_true", help="Include all runs instead of latest per scenario")
     parser.add_argument("--run-gap-sec", type=float, default=300.0, help="Gap in seconds to split runs per scenario")
-    parser.add_argument("--output", default="reports/chart_data.xlsx", help="Output Excel file")
+    parser.add_argument("--output", default="results/reports/chart_data.xlsx", help="Output Excel file")
     args = parser.parse_args()
 
     print(f"Loading data from {args.db}...")
@@ -525,6 +610,7 @@ def main():
             ("Bandwidth_Asymmetry", export_bandwidth_asymmetry(records)),
             ("Success_Rate", export_success_rate(records)),
             ("Streaming_Metrics", export_streaming_metrics(records)),
+            ("MCP_Tool_Metrics", export_mcp_tool_metrics(records)),
             ("Token_Counts", export_token_counts(records)),
             ("Latency_by_Profile", export_latency_by_profile(records)),
             ("Protocol_Comparison", export_protocol_comparison(records)),

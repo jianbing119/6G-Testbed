@@ -45,7 +45,10 @@ def load_records(db_path: Path, scenario_id: str) -> list[dict]:
 def pick_session(records: list[dict]) -> tuple[str | None, list[dict]]:
     sessions: dict[str, list[dict]] = {}
     for r in records:
-        sessions.setdefault(r.get("session_id", ""), []).append(r)
+        sid = r.get("session_id", "")
+        if sid.startswith("pcap_"):
+            continue
+        sessions.setdefault(sid, []).append(r)
 
     if not sessions:
         return None, []
@@ -433,6 +436,18 @@ def main() -> None:
         lines.append(f"## {display_label}")
         lines.append("")
 
+        LOCAL_INFERENCE_SCENARIOS = {"chat_vllm", "video_understanding_vllm"}
+        if scenario_id in LOCAL_INFERENCE_SCENARIOS:
+            lines.append("> **Local inference scenario.** Latency measurements reflect "
+                         "actual GPU inference time rather than cloud API round-trip. "
+                         "Network impairment is applied via tc/netem on the loopback "
+                         "interface, enabling clean separation of network and compute "
+                         "latency components.")
+            if scenario_id == "video_understanding_vllm":
+                lines.append("> The video is base64-encoded inline in the request "
+                             "(~1.3 MB), producing realistic upload-heavy traffic.")
+            lines.append("")
+
         if not session_records:
             lines.append("No records found for this scenario.")
             lines.append("")
@@ -484,10 +499,16 @@ def main() -> None:
             lines.append(json.dumps(trace_data.get("request"), indent=2, ensure_ascii=True, default=str))
             lines.append("```")
             lines.append("")
-            lines.append("### Sample Response (exact payload)")
+            resp_data = trace_data.get("response")
+            resp_format = ""
+            if isinstance(resp_data, dict):
+                resp_format = resp_data.get("format", resp_data.get("payload", {}).get("format", ""))
+            is_summary = "summary" in str(resp_format).lower()
+            resp_label = "Sample Response (summary)" if is_summary else "Sample Response (exact payload)"
+            lines.append(f"### {resp_label}")
             lines.append("")
             lines.append("```json")
-            lines.append(json.dumps(trace_data.get("response"), indent=2, ensure_ascii=True, default=str))
+            lines.append(json.dumps(resp_data, indent=2, ensure_ascii=True, default=str))
             lines.append("```")
             lines.append("")
             response_events = trace_data.get("response_events") or []

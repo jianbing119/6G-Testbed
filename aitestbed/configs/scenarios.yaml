@@ -1,6 +1,13 @@
 # Scenario Definitions for 6G AI Traffic Testbed
 
 scenarios:
+  # Scenario-level network fields:
+  #   network_interface: primary interface for tc/tcpdump when the runner uses the
+  #     default auto-detected interface. Use "lo" for local-only providers such as vLLM.
+  #   loopback_interface: auxiliary loopback interface used by scenario code for
+  #     HTTP-mode MCP shaping. This documents the expected path; the agent scenarios
+  #     already apply loopback tc rules internally when mcp_transport=http.
+
   chat_basic:
     type: "chat"
     description: "Basic single-turn chat interaction"
@@ -43,19 +50,21 @@ scenarios:
     description: "Chat interaction using vLLM-hosted Qwen3-VL"
     provider: "vllm"
     model: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    network_interface: "lo"
     stream: true
     prompts:
       - "Summarize recent advances in AI traffic analysis."
       - "Explain the role of edge computing in 6G architectures."
+      - "What are the key QoS requirements for real-time AI inference over mobile networks?"
 
   video_understanding_vllm:
     type: "video_understanding"
-    description: "Video understanding via vLLM (Qwen3-VL native video_url)"
+    description: "Video understanding via vLLM (Qwen3-VL, base64-encoded upload)"
     provider: "vllm"
     model: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    network_interface: "lo"
     stream: false
-    # Update to a valid local or remote video URL. For local files, start vLLM with --allowed-local-media-path.
-    video_url: "file:///media/test.mp4"
+    video_url: "file:///root/workspace/test1.mp4"
     prompts:
       - "Describe the main actions in the video."
 
@@ -113,6 +122,8 @@ scenarios:
     description: "Shopping assistant with tool calling using DeepSeek"
     provider: "deepseek"
     model: "deepseek-chat"
+    mcp_transport: "http"
+    loopback_interface: "lo"
     tools:
       - "check_price"
       - "search_products"
@@ -128,6 +139,8 @@ scenarios:
     description: "Research agent with web search capability using DeepSeek"
     provider: "deepseek"
     model: "deepseek-chat"
+    mcp_transport: "http"
+    loopback_interface: "lo"
     tools:
       - "web_search"
       - "fetch_url"
@@ -159,6 +172,8 @@ scenarios:
     description: "Shopping assistant with tool calling"
     provider: "openai"
     model: "gpt-5-mini"
+    mcp_transport: "http"
+    loopback_interface: "lo"
     tools:
       - "check_price"
       - "search_products"
@@ -174,6 +189,8 @@ scenarios:
     description: "Research agent with web search capability"
     provider: "openai"
     model: "gpt-5-mini"
+    mcp_transport: "http"
+    loopback_interface: "lo"
     tools:
       - "web_search"
       - "fetch_url"
@@ -187,6 +204,8 @@ scenarios:
     description: "General-purpose agent with full MCP access"
     provider: "openai"
     model: "gpt-5.2"
+    mcp_transport: "http"
+    loopback_interface: "lo"
     max_tool_calls: 10
     prompts:
       - "Research and write a brief report on quantum computing advances in 2026. Save the report to a file."
@@ -359,6 +378,230 @@ scenarios:
       - "Tell me about real-time AI applications"
 
   # =============================================================================
+  # Azure OpenAI Scenarios
+  # =============================================================================
+
+  chat_azure_openai:
+    type: "chat"
+    description: "Chat interaction using Azure OpenAI (GPT-5.2 deployment)"
+    disabled: true
+    provider: "azure_openai"
+    model: "gpt-5.2"
+    stream: false
+    prompts:
+      - "Briefly describe potential 6G media trends and AI services."
+      - "What are the key challenges for immersive media over mobile networks?"
+      - "Explain the role of edge computing in 6G architectures."
+
+  chat_azure_openai_streaming:
+    type: "chat"
+    description: "Streaming chat using Azure OpenAI"
+    disabled: true
+    provider: "azure_openai"
+    model: "gpt-5.2"
+    stream: true
+    max_turns: 5
+    prompts:
+      - "What is the Model Context Protocol (MCP) and how does it work?"
+      - "How can AI agents improve user experience in mobile applications?"
+      - "Describe traffic patterns for real-time AI inference."
+
+  shopping_agent_azure_openai:
+    type: "agent"
+    description: "Shopping assistant with tool calling using Azure OpenAI"
+    disabled: true
+    provider: "azure_openai"
+    model: "gpt-5.2"
+    tools:
+      - "check_price"
+      - "search_products"
+      - "get_reviews"
+    max_tool_calls: 5
+    prompts:
+      - "Find the best noise-cancelling headphones under $300"
+      - "What is the best 6G-capable smartphone under 1000 USD?"
+      - "Compare the top 3 wireless earbuds for video calls"
+
+  image_generation_azure:
+    type: "image"
+    description: "Image generation using GPT Image on Azure OpenAI"
+    disabled: true
+    provider: "azure_openai"
+    model: "gpt-image-1-mini"
+    size: "1024x1024"
+    quality: "standard"
+    prompts:
+      - "A futuristic 6G network visualization with AI agents communicating"
+      - "Abstract representation of network traffic patterns"
+      - "A mobile device showing immersive AR content"
+
+  # =============================================================================
+  # Azure AI Inference Scenarios (Phi, Llama, Mistral, etc.)
+  # =============================================================================
+
+  chat_azure_inference:
+    type: "chat"
+    description: "Chat interaction using Azure AI Inference (Phi-4-mini)"
+    disabled: true
+    provider: "azure_inference"
+    model: "Phi-4-mini-instruct"
+    stream: false
+    prompts:
+      - "Briefly describe potential 6G media trends and AI services."
+      - "What are the key challenges for immersive media over mobile networks?"
+      - "Explain the role of edge computing in 6G architectures."
+
+  chat_azure_inference_streaming:
+    type: "chat"
+    description: "Streaming chat using Azure AI Inference (Phi-4-mini)"
+    disabled: true
+    provider: "azure_inference"
+    model: "Phi-4-mini-instruct"
+    stream: true
+    max_turns: 5
+    prompts:
+      - "What is the Model Context Protocol (MCP) and how does it work?"
+      - "How can AI agents improve user experience in mobile applications?"
+      - "Describe traffic patterns for real-time AI inference."
+
+  chat_azure_inference_llama:
+    type: "chat"
+    description: "Streaming chat using Azure AI Inference (Llama 4 Maverick)"
+    disabled: true
+    provider: "azure_inference"
+    model: "Llama-4-Maverick-17B-128E-Instruct-FP8"
+    stream: true
+    max_turns: 5
+    prompts:
+      - "Explain how 6G networks will support AI workloads differently than 5G."
+      - "What QoE metrics are relevant for generative AI services?"
+
+  # =============================================================================
+  # Music Agent Scenarios (Spotify MCP)
+  # =============================================================================
+
+  music_search:
+    type: "music_agent"
+    description: "Music search agent using Spotify MCP tools"
+    disabled: true
+    provider: "openai"
+    model: "gpt-5-mini"
+    server_group: "music"
+    mcp_transport: "http"
+    loopback_interface: "lo"
+    max_tool_calls: 10
+    prompts:
+      - "Find the top 5 most popular songs by Rnbstylerz and recommend similar artists"
+      - "Search for upbeat techno music with high energy for a workout playlist"
+      - "What are the best pop albums released recently? Show me their top tracks"
+
+  music_playlist:
+    type: "music_agent"
+    description: "Playlist composition agent using Spotify recommendations"
+    disabled: true
+    provider: "openai"
+    model: "gpt-5-mini"
+    server_group: "music"
+    mcp_transport: "http"
+    loopback_interface: "lo"
+    max_tool_calls: 1
+    prompts:
+      - "Create a 15-track chill evening playlist with low energy and high valence. Mix indie and electronic genres."
+      - "Build a road trip playlist: start mellow, build energy in the middle, then wind down. 12 tracks total."
+      - "I like Daft Punk and Tame Impala. Create a playlist of 10 tracks I might enjoy based on these artists."
+
+  music_research:
+    type: "music_research_agent"
+    description: "Music research agent combining Spotify and web search"
+    disabled: true
+    provider: "openai"
+    model: "gpt-5-mini"
+    server_group: "music_research"
+    mcp_transport: "http"
+    loopback_interface: "lo"
+    max_tool_calls: 1
+    prompts:
+      - "Research the top jazz albums of 2025, find standout tracks on Spotify, and include background on each artist from the web."
+      - "Find trending K-pop artists, get their top tracks on Spotify, and search for their upcoming concert tours."
+
+  music_search_deepseek:
+    type: "music_agent"
+    description: "Music search agent using DeepSeek with Spotify MCP"
+    disabled: true
+    provider: "deepseek"
+    model: "deepseek-chat"
+    server_group: "music"
+    mcp_transport: "http"
+    loopback_interface: "lo"
+    max_tool_calls: 1
+    prompts:
+      - "Find the top 5 most popular songs by Radiohead and recommend similar artists"
+      - "Search for upbeat electronic music with high energy for a workout playlist"
+
+  # =============================================================================
+  # Trading / Market Data Agent Scenarios (Alpaca MCP)
+  # =============================================================================
+
+  trading_market_data:
+    type: "trading_agent"
+    description: "Market data analysis agent using Alpaca MCP tools"
+    provider: "openai"
+    model: "gpt-5-mini"
+    server_group: "trading"
+    mcp_transport: "http"
+    loopback_interface: "lo"
+    max_tool_calls: 15
+    prompts:
+      - "Get the latest quote and a 5-day bar chart for AAPL and MSFT, then compare their recent performance."
+      - "Check if the market is open right now. Then get snapshots for NVDA, GOOGL, and AMZN and rank them by today's volume."
+      - "Get the latest crypto quotes for BTC/USD and ETH/USD. Also fetch 7-day bars for both and summarize the trend."
+
+  trading_options_scan:
+    type: "trading_agent"
+    description: "Options market data scan using Alpaca MCP tools"
+    disabled: true  # Upstream bug: alpaca-mcp-server uses wrong endpoint for options contracts (404)
+    provider: "openai"
+    model: "gpt-5-mini"
+    server_group: "trading"
+    mcp_transport: "http"
+    loopback_interface: "lo"
+    max_tool_calls: 12
+    prompts:
+      - "Find available option contracts for AAPL expiring in the next 30 days. Get the latest quote for the nearest at-the-money call and put."
+      - "Look up TSLA option contracts. Get quotes for a near-term call and compare the bid-ask spread to the stock's latest quote spread."
+
+  # =============================================================================
+  # Playwright Browser Automation Scenarios
+  # =============================================================================
+
+  playwright_web_test:
+    type: "playwright_agent"
+    description: "Browser automation agent using Playwright MCP tools"
+    provider: "openai"
+    model: "gpt-5-mini"
+    server_group: "playwright"
+    mcp_transport: "http"
+    loopback_interface: "lo"
+    max_tool_calls: 15
+    prompts:
+      - "Navigate to https://example.com, extract the page title and all visible text, and summarize what you see."
+      - "Go to https://httpbin.org/forms/post, fill in the form fields with test data, submit it, and verify the response."
+
+  playwright_web_test_text:
+    type: "playwright_agent"
+    description: "Browser automation agent using text extraction (no screenshots)"
+    provider: "openai"
+    model: "gpt-5-mini"
+    server_group: "playwright"
+    mcp_transport: "http"
+    loopback_interface: "lo"
+    max_tool_calls: 15
+    use_screenshots: false
+    prompts:
+      - "Navigate to https://example.com and extract all headings and links on the page."
+      - "Go to https://httpbin.org/get, read the JSON response displayed on the page, and summarize it."
+
+  # =============================================================================
   # Direct Web Search Scenarios (No MCP - Multi-threaded HTTP)
   # =============================================================================
 
@@ -383,6 +626,7 @@ scenarios:
   direct_web_search_google:
     type: "direct_search"
     description: "Multi-threaded web search using Google Custom Search API"
+    disabled: true
     provider: "openai"
     model: "gpt-5-mini"
     search_engine: "google"
@@ -447,7 +691,7 @@ scenarios:
 
 # Default experiment settings
 defaults:
-  runs_per_scenario: 10
+  runs_per_scenario: 10          # Direct-orchestrator default; run_full_tests.sh overrides globally
   inter_run_delay_sec: 3.0        # Increased from 1.0 to avoid rate limits
   timeout_sec: 180                 # Increased for slow network profiles
   retry_count: 3
@@ -456,97 +700,184 @@ defaults:
   stall_gap_sec: 1.0
   burst_gap_sec: 1.0
 
+# Full-suite runner profile set.
+# Mirrors configs/profiles.yaml:selected_profiles so the matrix matches run_full_tests.sh.
+runner_profile_sets:
+  full_suite_profiles: &full_suite_profiles
+    - no_emulation
+    - ideal_6g
+    - 5g_urban
+    - wifi_good
+    - cell_edge
+    - satellite
+    - congested
+    - 5qi_7
+    - 5qi_80
+
 # Test matrix definition
+# Mirrors the scenario coverage in run_full_tests.sh.
+# `runs` is intentionally omitted so callers can supply a single global run count.
 test_matrix:
   - scenario: "chat_basic"
-    profiles: ["ideal_6g", "5g_urban", "cell_edge"]
-    runs: 10
+    phase: "chat"
+    profiles: *full_suite_profiles
     priority: "high"
 
   - scenario: "chat_streaming"
-    profiles: ["ideal_6g", "5g_urban", "cell_edge"]
-    runs: 10
+    phase: "chat"
+    profiles: *full_suite_profiles
     priority: "high"
 
-  - scenario: "shopping_agent"
-    profiles: ["ideal_6g", "5g_urban", "edge_rural"]
-    runs: 10
-    priority: "high"
-
-  - scenario: "image_generation"
-    profiles: ["ideal_6g", "5g_urban"]
-    runs: 5
-    priority: "medium"
-
-  - scenario: "web_search_agent"
-    profiles: ["5g_urban", "congested"]
-    runs: 10
-    priority: "medium"
-
-  # Direct search scenarios (no MCP)
-  - scenario: "direct_web_search"
-    profiles: ["ideal_6g", "5g_urban", "cell_edge"]
-    runs: 10
-    priority: "high"
-
-  - scenario: "direct_web_search_burst"
-    profiles: ["ideal_6g", "5g_urban"]
-    runs: 5
-    priority: "medium"
-
-  - scenario: "parallel_search_benchmark"
-    profiles: ["ideal_6g", "5g_urban"]
-    runs: 3
-    priority: "low"
-
-  # Real-time conversational AI scenarios
   - scenario: "realtime_text"
-    profiles: ["ideal_6g", "5g_urban", "cell_edge"]
-    runs: 10
+    phase: "realtime"
+    profiles: *full_suite_profiles
     priority: "high"
 
   - scenario: "realtime_interactive"
-    profiles: ["ideal_6g", "5g_urban"]
-    runs: 5
+    phase: "realtime"
+    profiles: *full_suite_profiles
     priority: "medium"
 
   - scenario: "realtime_technical"
-    profiles: ["ideal_6g", "5g_urban", "cell_edge"]
-    runs: 5
+    phase: "realtime"
+    profiles: *full_suite_profiles
+    priority: "medium"
+
+  - scenario: "realtime_multilingual"
+    phase: "realtime"
+    profiles: *full_suite_profiles
     priority: "medium"
 
   - scenario: "realtime_audio"
-    profiles: ["ideal_6g", "5g_urban"]
-    runs: 5
+    phase: "realtime"
+    profiles: *full_suite_profiles
     priority: "medium"
 
-  # DeepSeek LLM scenarios
+  - scenario: "realtime_audio_webrtc"
+    phase: "realtime"
+    profiles: *full_suite_profiles
+    priority: "medium"
+
+  - scenario: "realtime_text_webrtc"
+    phase: "realtime"
+    profiles: *full_suite_profiles
+    priority: "medium"
+
+  - scenario: "image_generation"
+    phase: "image"
+    profiles: *full_suite_profiles
+    priority: "medium"
+
+  - scenario: "direct_web_search"
+    phase: "search"
+    profiles: *full_suite_profiles
+    priority: "high"
+
   - scenario: "chat_deepseek"
-    profiles: ["ideal_6g", "5g_urban", "cell_edge"]
-    runs: 10
+    phase: "deepseek"
+    profiles: *full_suite_profiles
     priority: "high"
 
   - scenario: "chat_deepseek_streaming"
-    profiles: ["ideal_6g", "5g_urban", "cell_edge"]
-    runs: 10
+    phase: "deepseek"
+    profiles: *full_suite_profiles
     priority: "high"
 
   - scenario: "chat_deepseek_coder"
-    profiles: ["ideal_6g", "5g_urban"]
-    runs: 5
+    phase: "deepseek"
+    profiles: *full_suite_profiles
     priority: "medium"
 
   - scenario: "chat_deepseek_reasoner"
-    profiles: ["ideal_6g", "5g_urban"]
-    runs: 5
-    priority: "medium"
-
-  - scenario: "shopping_agent_deepseek"
-    profiles: ["ideal_6g", "5g_urban"]
-    runs: 5
+    phase: "deepseek"
+    profiles: *full_suite_profiles
     priority: "medium"
 
   - scenario: "direct_web_search_deepseek"
-    profiles: ["ideal_6g", "5g_urban", "cell_edge"]
-    runs: 10
+    phase: "deepseek"
+    profiles: *full_suite_profiles
     priority: "high"
+
+  - scenario: "chat_gemini"
+    phase: "gemini"
+    profiles: *full_suite_profiles
+    priority: "medium"
+
+  - scenario: "trading_market_data"
+    phase: "trading"
+    profiles: *full_suite_profiles
+    priority: "medium"
+    runner_enabled_by_default: true
+    prereqs:
+      - "ALPACA_API_KEY"
+      - "ALPACA_SECRET_KEY"
+
+  - scenario: "trading_options_scan"
+    phase: "trading"
+    profiles: *full_suite_profiles
+    priority: "medium"
+    runner_enabled_by_default: true
+    prereqs:
+      - "ALPACA_API_KEY"
+      - "ALPACA_SECRET_KEY"
+
+  - scenario: "computer_control_agent"
+    phase: "computer_use"
+    profiles: *full_suite_profiles
+    priority: "medium"
+    runner_enabled_by_default: true
+    prereqs:
+      - "playwright_chromium"
+
+  - scenario: "playwright_web_test"
+    phase: "playwright"
+    profiles: *full_suite_profiles
+    priority: "medium"
+    runner_enabled_by_default: true
+    prereqs:
+      - "playwright_chromium"
+
+  - scenario: "multimodal_analysis"
+    phase: "multimodal"
+    profiles: *full_suite_profiles
+    priority: "medium"
+    runner_enabled_by_default: true
+    prereqs:
+      - "examples/assets/network_diagram.png"
+
+  - scenario: "direct_web_search_google"
+    phase: "google_search"
+    profiles: *full_suite_profiles
+    priority: "medium"
+    runner_enabled_by_default: false
+    prereqs:
+      - "GOOGLE_SEARCH_API_KEY"
+      - "GOOGLE_SEARCH_CX"
+
+  - scenario: "direct_web_search_burst"
+    phase: "stress"
+    profiles: *full_suite_profiles
+    priority: "medium"
+    runner_enabled_by_default: false
+
+  - scenario: "parallel_search_benchmark"
+    phase: "stress"
+    profiles: *full_suite_profiles
+    priority: "low"
+    runner_enabled_by_default: false
+
+  - scenario: "chat_vllm"
+    phase: "vllm"
+    profiles: *full_suite_profiles
+    priority: "high"
+    runner_enabled_by_default: true
+    prereqs:
+      - "http://localhost:8000/v1/models"
+
+  - scenario: "video_understanding_vllm"
+    phase: "vllm"
+    profiles: *full_suite_profiles
+    priority: "high"
+    runner_enabled_by_default: true
+    prereqs:
+      - "http://localhost:8000/v1/models"

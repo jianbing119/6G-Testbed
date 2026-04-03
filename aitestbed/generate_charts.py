@@ -56,7 +56,11 @@ def load_data_from_db(db_path: str = "logs/traffic_logs.db", since_timestamp: fl
     rows = cursor.fetchall()
     conn.close()
 
-    return [dict(row) for row in rows]
+    # Filter out pcap capture summary records and timeout placeholders
+    return [
+        dict(row) for row in rows
+        if not (dict(row).get("session_id") or "").startswith(("pcap_", "timeout_"))
+    ]
 
 
 def get_latest_run_timestamp(db_path: str = "logs/traffic_logs.db", run_duration_minutes: int = None) -> float:
@@ -100,16 +104,21 @@ def get_latest_run_timestamp(db_path: str = "logs/traffic_logs.db", run_duration
 
 
 def fuse_latest_runs(records: list[dict], gap_sec: float = 300.0) -> list[dict]:
-    """Keep only the latest run per scenario based on timestamp gaps."""
+    """Keep only the latest run per scenario+profile based on timestamp gaps.
+
+    Groups by (scenario_id, network_profile) so that profiles run in
+    different --resume sessions are all retained.
+    """
     if not records:
         return []
-    by_scenario: dict[str, list[dict]] = defaultdict(list)
+    by_key: dict[str, list[dict]] = defaultdict(list)
     for record in records:
         scenario = record.get("scenario_id") or "unknown"
-        by_scenario[scenario].append(record)
+        profile = record.get("network_profile") or "unknown"
+        by_key[f"{scenario}/{profile}"].append(record)
 
     fused: list[dict] = []
-    for recs in by_scenario.values():
+    for recs in by_key.values():
         recs.sort(key=lambda r: r.get("timestamp", 0.0))
         start_idx = 0
         for i in range(len(recs) - 1, 0, -1):
@@ -228,7 +237,7 @@ def generate_latency_by_scenario(records: list[dict], output_dir: Path) -> str:
 
     plt.tight_layout()
     output_path = output_dir / "latency_by_scenario.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -284,7 +293,7 @@ def generate_throughput_chart(records: list[dict], output_dir: Path) -> str:
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.3)
     output_path = output_dir / "throughput_by_scenario.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -344,7 +353,109 @@ def generate_throughput_over_time(records: list[dict], output_dir: Path, bucket_
 
     plt.tight_layout()
     output_path = output_dir / "throughput_over_time.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return str(output_path)
+
+
+def generate_throughput_burstiness_chart(records: list[dict], output_dir: Path) -> str:
+    """Candlestick-style boxplot of per-request throughput (bytes/s) by scenario.
+
+    Wide boxes indicate bursty traffic; narrow boxes indicate steady throughput.
+    """
+    output_path = Path(output_dir) / "throughput_burstiness.png"
+    tput_by_scenario: dict[str, list[float]] = defaultdict(list)
+    recs_by_scenario: dict[str, list[dict]] = defaultdict(list)
+
+    for r in records:
+        lat = r.get("latency_sec") or 0.0
+        resp = r.get("response_bytes") or 0
+        req = r.get("request_bytes") or 0
+        if lat > 0:
+            tput = (req + resp) / lat  # total bytes/sec
+            scenario = r.get("scenario_id", "unknown")
+            tput_by_scenario[scenario].append(tput)
+            recs_by_scenario[scenario].append(r)
+
+    if not tput_by_scenario:
+        return ""
+
+    import numpy as np
+
+    # Sort by median throughput
+    sorted_scenarios = sorted(
+        tput_by_scenario.items(),
+        key=lambda x: np.median(x[1]),
+        reverse=True,
+    )
+
+    labels = [format_scenario_label(s, recs_by_scenario[s]) for s, _ in sorted_scenarios]
+    data = [vals for _, vals in sorted_scenarios]
+
+    fig, ax = plt.subplots(figsize=(16, 8))
+
+    bp = ax.boxplot(
+        data,
+        vert=True,
+        patch_artist=True,
+        showfliers=True,
+        flierprops=dict(marker='o', markersize=3, alpha=0.4, markerfacecolor='#e74c3c'),
+        medianprops=dict(color='black', linewidth=2),
+        whiskerprops=dict(linewidth=1.2),
+        capprops=dict(linewidth=1.2),
+    )
+
+    # Color by burstiness ratio (max/median)
+    for i, (patch, vals) in enumerate(zip(bp['boxes'], data)):
+        median = np.median(vals)
+        p95 = np.percentile(vals, 95)
+        ratio = p95 / max(median, 1)
+        if ratio > 20:
+            color = '#e74c3c'   # Very bursty (red)
+        elif ratio > 5:
+            color = '#f39c12'   # Moderate burst (orange)
+        else:
+            color = '#27ae60'   # Steady (green)
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+
+    ax.set_yscale('log')
+    ax.set_ylabel('Throughput (bytes/sec, log scale)')
+    ax.set_title('Traffic Burstiness by Scenario — Per-Request Throughput Distribution')
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels(labels, fontsize=7, rotation=55, ha='right')
+    ax.grid(axis='y', alpha=0.3)
+
+    # Add legend for color coding
+    from matplotlib.patches import Patch
+    ax.legend(
+        handles=[
+            Patch(facecolor='#e74c3c', alpha=0.7, label='Very bursty (P95/median > 20x)'),
+            Patch(facecolor='#f39c12', alpha=0.7, label='Moderate burst (5–20x)'),
+            Patch(facecolor='#27ae60', alpha=0.7, label='Steady (< 5x)'),
+        ],
+        loc='upper right',
+        fontsize=8,
+    )
+
+    # Annotate with burstiness ratio
+    for i, vals in enumerate(data):
+        median = np.median(vals)
+        p95 = np.percentile(vals, 95)
+        p5 = np.percentile(vals, 5)
+        ratio = p95 / max(p5, 1)
+        ax.annotate(
+            f'{ratio:.0f}x',
+            xy=(i + 1, p95),
+            xytext=(0, 5),
+            textcoords='offset points',
+            ha='center', va='bottom',
+            fontsize=6, color='gray',
+        )
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -365,17 +476,17 @@ def generate_bandwidth_asymmetry_chart(records: list[dict], output_dir: Path) ->
         total_ul = sum(r.get("request_bytes", 0) or 0 for r in recs)
         total_dl = sum(r.get("response_bytes", 0) or 0 for r in recs)
 
-        if total_dl > 0:
-            ratio = total_dl / max(total_ul, 1)  # DL:UL ratio
+        if total_ul > 0 or total_dl > 0:
+            ratio = max(total_ul, 1) / max(total_dl, 1)  # UL:DL ratio
             scenarios.append(format_scenario_label(scenario, recs))
             ratios.append(ratio)
-            # Color based on asymmetry
-            if ratio > 100:
-                colors.append('#e74c3c')  # Very asymmetric (red)
-            elif ratio > 10:
-                colors.append('#f39c12')  # Moderate (orange)
-            else:
+            # Color based on direction
+            if ratio > 1:
+                colors.append('#e74c3c')  # UL-heavy (red)
+            elif ratio > 0.1:
                 colors.append('#27ae60')  # Near symmetric (green)
+            else:
+                colors.append('#3498db')  # DL-heavy (blue)
 
     if not scenarios:
         return None
@@ -385,28 +496,34 @@ def generate_bandwidth_asymmetry_chart(records: list[dict], output_dir: Path) ->
     bars = ax.bar(range(len(scenarios)), ratios, color=colors)
 
     ax.set_xlabel('Scenario')
-    ax.set_ylabel('DL:UL Ratio (log scale)')
-    ax.set_title('Bandwidth Asymmetry by Scenario (Downlink / Uplink)')
+    ax.set_ylabel('UL/DL Ratio (log scale)')
+    ax.set_title('Bandwidth Asymmetry by Scenario (Uplink / Downlink)')
     ax.set_xticks(range(len(scenarios)))
-    ax.set_xticklabels(scenarios, fontsize=8, rotation=35, ha='right')
+    ax.set_xticklabels(scenarios, fontsize=8, rotation=45, ha='right')
     ax.set_yscale('log')
     ax.axhline(y=1, color='black', linestyle='--', alpha=0.5, label='Symmetric (1:1)')
-    ax.axhline(y=10, color='gray', linestyle=':', alpha=0.5, label='10:1')
-    ax.axhline(y=100, color='gray', linestyle=':', alpha=0.5, label='100:1')
+    ax.axhline(y=0.1, color='gray', linestyle=':', alpha=0.3, label='DL-heavy (10:1)')
+    ax.axhline(y=0.01, color='gray', linestyle=':', alpha=0.3, label='DL-heavy (100:1)')
     ax.legend()
     ax.grid(axis='y', alpha=0.3)
 
     # Add value labels
     for bar, ratio in zip(bars, ratios):
         height = bar.get_height()
-        ax.annotate(f'{ratio:.0f}:1',
+        if ratio >= 1:
+            label = f'{ratio:.1f}:1 UL'
+        elif ratio > 0:
+            label = f'1:{1/ratio:.0f} DL'
+        else:
+            label = 'DL only'
+        ax.annotate(label,
                    xy=(bar.get_x() + bar.get_width() / 2, height),
                    xytext=(0, 3), textcoords="offset points",
                    ha='center', va='bottom', fontsize=7, rotation=45)
 
     plt.tight_layout()
     output_path = output_dir / "bandwidth_asymmetry.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -423,6 +540,7 @@ def generate_protocol_comparison_chart(records: list[dict], output_dir: Path) ->
         "REST Streaming": [],
         "WebSocket": [],
         "WebRTC": [],
+        "MCP Agent": [],
     }
 
     for r in records:
@@ -431,7 +549,12 @@ def generate_protocol_comparison_chart(records: list[dict], output_dir: Path) ->
         if not latency or latency <= 0:
             continue
 
-        if "webrtc" in scenario.lower():
+        if any(kw in scenario.lower() for kw in (
+            "music", "trading", "playwright", "shopping_agent",
+            "web_search_agent", "general_agent", "computer_control",
+        )):
+            protocols["MCP Agent"].append(latency)
+        elif "webrtc" in scenario.lower():
             protocols["WebRTC"].append(latency)
         elif "realtime" in scenario.lower():
             protocols["WebSocket"].append(latency)
@@ -453,7 +576,7 @@ def generate_protocol_comparison_chart(records: list[dict], output_dir: Path) ->
     labels = list(valid_protocols.keys())
 
     bp = ax1.boxplot(data, labels=labels, patch_artist=True)
-    colors = ['#3498db', '#9b59b6', '#e67e22', '#1abc9c']
+    colors = ['#3498db', '#9b59b6', '#e67e22', '#1abc9c', '#e74c3c']
     for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
         patch.set_facecolor(color)
         patch.set_alpha(0.7)
@@ -480,7 +603,7 @@ def generate_protocol_comparison_chart(records: list[dict], output_dir: Path) ->
 
     plt.tight_layout()
     output_path = output_dir / "protocol_comparison.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -538,7 +661,7 @@ def generate_success_rate_chart(records: list[dict], output_dir: Path) -> str:
 
     plt.tight_layout()
     output_path = output_dir / "success_rate.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -578,14 +701,14 @@ def generate_data_volume_chart(records: list[dict], output_dir: Path) -> str:
     ax.set_ylabel('Total Data Volume (KB, log scale)')
     ax.set_title('Total Data Transferred by Scenario')
     ax.set_xticks(x)
-    ax.set_xticklabels(scenarios, fontsize=8, rotation=35, ha='right')
+    ax.set_xticklabels(scenarios, fontsize=8, rotation=45, ha='right')
     ax.legend()
     ax.set_yscale('log')
     ax.grid(axis='y', alpha=0.3)
 
     plt.tight_layout()
     output_path = output_dir / "data_volume.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -653,7 +776,7 @@ def generate_latency_heatmap(records: list[dict], output_dir: Path) -> str:
 
     plt.tight_layout()
     output_path = output_dir / "latency_heatmap.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -724,7 +847,7 @@ def generate_ttft_chart(records: list[dict], output_dir: Path) -> str:
 
     plt.tight_layout()
     output_path = output_dir / "ttft_by_scenario.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -777,7 +900,7 @@ def generate_latency_breakdown_chart(records: list[dict], output_dir: Path) -> s
 
     plt.tight_layout()
     output_path = output_dir / "latency_breakdown.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -818,9 +941,9 @@ def generate_token_throughput_chart(records: list[dict], output_dir: Path) -> st
 
     ax.set_xlabel('Scenario')
     ax.set_ylabel('Tokens per Second')
-    ax.set_title('Token Generation Throughput by Scenario')
+    ax.set_title('Observed Token Arrival Rate by Scenario (Client-Side)')
     ax.set_xticks(range(len(scenarios)))
-    ax.set_xticklabels(scenarios, fontsize=8, rotation=35, ha='right')
+    ax.set_xticklabels(scenarios, fontsize=8, rotation=45, ha='right')
     ax.grid(axis='y', alpha=0.3)
 
     # Add value labels
@@ -833,7 +956,7 @@ def generate_token_throughput_chart(records: list[dict], output_dir: Path) -> st
 
     plt.tight_layout()
     output_path = output_dir / "token_throughput.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -875,6 +998,13 @@ def generate_streaming_metrics_chart(records: list[dict], output_dir: Path) -> s
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
+    # Build legend handles for providers
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(facecolor=color, label=provider)
+        for provider, color in provider_colors.items()
+    ]
+
     # Chunk counts
     bars1 = ax1.bar(range(len(labels)), chunk_counts, color=colors)
     ax1.set_xlabel('Scenario (Provider)')
@@ -883,6 +1013,7 @@ def generate_streaming_metrics_chart(records: list[dict], output_dir: Path) -> s
     ax1.set_xticks(range(len(labels)))
     ax1.set_xticklabels(labels, fontsize=7, rotation=45, ha='right')
     ax1.grid(axis='y', alpha=0.3)
+    ax1.legend(handles=legend_handles, fontsize=7, loc='upper right')
 
     # Chunk rates
     bars2 = ax2.bar(range(len(labels)), chunk_rates, color=colors)
@@ -892,10 +1023,11 @@ def generate_streaming_metrics_chart(records: list[dict], output_dir: Path) -> s
     ax2.set_xticks(range(len(labels)))
     ax2.set_xticklabels(labels, fontsize=7, rotation=45, ha='right')
     ax2.grid(axis='y', alpha=0.3)
+    ax2.legend(handles=legend_handles, fontsize=7, loc='upper right')
 
     plt.tight_layout()
     output_path = output_dir / "streaming_metrics.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -938,7 +1070,7 @@ def generate_tool_usage_chart(records: list[dict], output_dir: Path) -> str:
     ax1.set_ylabel('Average Tool Calls')
     ax1.set_title('Tool Usage: Calls per Request')
     ax1.set_xticks(range(len(scenarios)))
-    ax1.set_xticklabels(scenarios, fontsize=8)
+    ax1.set_xticklabels(scenarios, fontsize=8, rotation=45, ha='right')
     ax1.grid(axis='y', alpha=0.3)
 
     # Tool latencies
@@ -947,69 +1079,1375 @@ def generate_tool_usage_chart(records: list[dict], output_dir: Path) -> str:
     ax2.set_ylabel('Tool Latency (seconds)')
     ax2.set_title('Tool Usage: Average Latency')
     ax2.set_xticks(range(len(scenarios)))
-    ax2.set_xticklabels(scenarios, fontsize=8)
+    ax2.set_xticklabels(scenarios, fontsize=8, rotation=45, ha='right')
     ax2.grid(axis='y', alpha=0.3)
 
     plt.tight_layout()
     output_path = output_dir / "tool_usage.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
 
 
-def generate_error_analysis_chart(records: list[dict], output_dir: Path) -> str:
-    """Generate error analysis chart by error type."""
+def _parse_metadata(record: dict) -> dict:
+    """Parse metadata JSON string from a record."""
+    meta = record.get("metadata")
+    if not meta:
+        return {}
+    if isinstance(meta, str):
+        try:
+            return json.loads(meta)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return meta
+
+
+def generate_mcp_efficiency_chart(records: list[dict], output_dir: Path) -> str:
+    """Generate MCP efficiency analysis: loop factor, latency overhead, byte overhead.
+
+    Shows per-scenario and per-profile how much overhead the MCP agent loop
+    adds compared to the useful final response.
+    """
     if not HAS_MATPLOTLIB:
         return None
 
-    # Count errors by type
-    error_counts = defaultdict(int)
+    # Group records by session to compute per-session efficiency
+    sessions: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        sid = r.get("session_id")
+        if sid:
+            sessions[sid].append(r)
+
+    # Compute per-session metrics
+    scenario_data: dict[str, list[dict]] = defaultdict(list)
+    for sid, recs in sessions.items():
+        llm_records = []
+        tool_records = []
+        for r in recs:
+            meta = _parse_metadata(r)
+            if meta.get("type") == "mcp_tool_call":
+                tool_records.append(r)
+            elif meta.get("type") == "llm_api_call" or (r.get("tokens_out") or 0) > 0:
+                llm_records.append(r)
+
+        if not llm_records:
+            continue
+
+        scenario = recs[0].get("scenario_id", "unknown")
+        profile = recs[0].get("network_profile", "unknown")
+
+        total_llm_latency = sum(r.get("latency_sec", 0) or 0 for r in llm_records)
+        total_tool_latency = sum(r.get("tool_latency_sec", 0) or 0 for r in tool_records)
+        total_latency = total_llm_latency + total_tool_latency
+
+        total_llm_bytes = sum(
+            (r.get("request_bytes", 0) or 0) + (r.get("response_bytes", 0) or 0)
+            for r in llm_records
+        )
+        total_tool_bytes = sum(
+            (r.get("request_bytes", 0) or 0) + (r.get("response_bytes", 0) or 0)
+            for r in tool_records
+        )
+        total_bytes = total_llm_bytes + total_tool_bytes
+
+        # Final response = last LLM call (the one that produces the answer)
+        final_llm = llm_records[-1]
+        final_latency = final_llm.get("latency_sec", 0) or 0
+        final_bytes = (final_llm.get("response_bytes", 0) or 0)
+
+        api_calls = len(llm_records)
+        tool_calls = len(tool_records)
+
+        scenario_data[scenario].append({
+            "profile": profile,
+            "loop_factor": api_calls + tool_calls,
+            "api_calls": api_calls,
+            "tool_calls": tool_calls,
+            "total_latency": total_latency,
+            "final_latency": final_latency,
+            "latency_overhead_pct": ((total_latency - final_latency) / total_latency * 100)
+                if total_latency > 0 else 0,
+            "total_bytes": total_bytes,
+            "final_bytes": final_bytes,
+            "byte_overhead_pct": ((total_bytes - final_bytes) / total_bytes * 100)
+                if total_bytes > 0 else 0,
+            "tool_latency_pct": (total_tool_latency / total_latency * 100)
+                if total_latency > 0 else 0,
+            "tool_bytes_pct": (total_tool_bytes / total_bytes * 100)
+                if total_bytes > 0 else 0,
+        })
+
+    if not scenario_data:
+        return None
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle("MCP Agent Efficiency Analysis", fontsize=14, fontweight="bold")
+
+    scenarios = sorted(scenario_data.keys())
+    labels = [format_scenario_label(s, scenario_data[s]) for s in scenarios]
+    x = range(len(scenarios))
+
+    # --- Chart 1: Loop Factor (API calls + tool calls per session) ---
+    ax = axes[0, 0]
+    api_means = []
+    tool_means = []
+    for s in scenarios:
+        data = scenario_data[s]
+        api_means.append(sum(d["api_calls"] for d in data) / len(data))
+        tool_means.append(sum(d["tool_calls"] for d in data) / len(data))
+
+    bars1 = ax.bar(x, api_means, label="LLM API Calls", color="#3498db")
+    bars2 = ax.bar(x, tool_means, bottom=api_means, label="MCP Tool Calls", color="#e67e22")
+    ax.set_ylabel("Calls per Session")
+    ax.set_title("Loop Factor: Calls per User Prompt")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=7, rotation=45, ha="right")
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
+    for i, (a, t) in enumerate(zip(api_means, tool_means)):
+        ax.text(i, a + t + 0.1, f"{a + t:.1f}", ha="center", fontsize=8)
+
+    # --- Chart 2: Latency Overhead (%) ---
+    ax = axes[0, 1]
+    overhead_means = []
+    tool_lat_means = []
+    for s in scenarios:
+        data = scenario_data[s]
+        overhead_means.append(sum(d["latency_overhead_pct"] for d in data) / len(data))
+        tool_lat_means.append(sum(d["tool_latency_pct"] for d in data) / len(data))
+
+    bar_width = 0.35
+    x_arr = list(x)
+    ax.bar([i - bar_width / 2 for i in x_arr], overhead_means,
+           bar_width, label="Total Overhead", color="#e74c3c")
+    ax.bar([i + bar_width / 2 for i in x_arr], tool_lat_means,
+           bar_width, label="Tool Latency Share", color="#9b59b6")
+    ax.set_ylabel("Percentage of Total Latency (%)")
+    ax.set_title("Latency Overhead vs Final Response")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=7, rotation=45, ha="right")
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_ylim(0, 100)
+
+    # --- Chart 3: Byte Overhead (%) ---
+    ax = axes[1, 0]
+    byte_overhead_means = []
+    tool_byte_means = []
+    for s in scenarios:
+        data = scenario_data[s]
+        byte_overhead_means.append(sum(d["byte_overhead_pct"] for d in data) / len(data))
+        tool_byte_means.append(sum(d["tool_bytes_pct"] for d in data) / len(data))
+
+    ax.bar([i - bar_width / 2 for i in x_arr], byte_overhead_means,
+           bar_width, label="Total Overhead", color="#e74c3c")
+    ax.bar([i + bar_width / 2 for i in x_arr], tool_byte_means,
+           bar_width, label="MCP Tool Traffic Share", color="#9b59b6")
+    ax.set_ylabel("Percentage of Total Bytes (%)")
+    ax.set_title("Traffic Overhead vs Final Response")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=7, rotation=45, ha="right")
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_ylim(0, 100)
+
+    # --- Chart 4: Overhead by Network Profile ---
+    ax = axes[1, 1]
+    # Aggregate all agent sessions by profile
+    profile_data: dict[str, list[dict]] = defaultdict(list)
+    for s in scenarios:
+        for d in scenario_data[s]:
+            profile_data[d["profile"]].append(d)
+
+    if profile_data:
+        profiles = sorted(profile_data.keys())
+        p_labels = profiles
+        p_x = range(len(profiles))
+        p_overhead = [
+            sum(d["latency_overhead_pct"] for d in profile_data[p]) / len(profile_data[p])
+            for p in profiles
+        ]
+        p_loop = [
+            sum(d["loop_factor"] for d in profile_data[p]) / len(profile_data[p])
+            for p in profiles
+        ]
+
+        ax2 = ax.twinx()
+        bars_o = ax.bar([i - bar_width / 2 for i in range(len(profiles))],
+                        p_overhead, bar_width, label="Latency Overhead %", color="#e74c3c", alpha=0.8)
+        bars_l = ax2.bar([i + bar_width / 2 for i in range(len(profiles))],
+                         p_loop, bar_width, label="Loop Factor", color="#3498db", alpha=0.8)
+        ax.set_ylabel("Latency Overhead (%)", color="#e74c3c")
+        ax2.set_ylabel("Loop Factor (calls/session)", color="#3498db")
+        ax.set_title("MCP Overhead by Network Profile")
+        ax.set_xticks(range(len(profiles)))
+        ax.set_xticklabels(p_labels, fontsize=7, rotation=45, ha="right")
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper left")
+        ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "mcp_efficiency.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return str(output_path)
+
+
+def generate_mcp_latency_breakdown_chart(records: list[dict], output_dir: Path) -> str:
+    """Generate stacked bar chart breaking down where time is spent in agent sessions.
+
+    Shows per-profile: LLM inference time vs MCP tool time vs MCP protocol overhead.
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    sessions: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        sid = r.get("session_id")
+        if sid:
+            sessions[sid].append(r)
+
+    profile_breakdown: dict[str, dict] = defaultdict(lambda: {
+        "llm_latency": [], "tool_latency": [], "total_latency": []
+    })
+
+    for sid, recs in sessions.items():
+        profile = recs[0].get("network_profile", "unknown")
+        total_llm = 0.0
+        total_tool = 0.0
+
+        for r in recs:
+            meta = _parse_metadata(r)
+            if meta.get("type") == "mcp_tool_call":
+                total_tool += r.get("tool_latency_sec", 0) or 0
+            else:
+                total_llm += r.get("latency_sec", 0) or 0
+
+        total = total_llm + total_tool
+        if total > 0:
+            profile_breakdown[profile]["llm_latency"].append(total_llm)
+            profile_breakdown[profile]["tool_latency"].append(total_tool)
+            profile_breakdown[profile]["total_latency"].append(total)
+
+    if not profile_breakdown:
+        return None
+
+    profiles = sorted(profile_breakdown.keys())
+    llm_means = [sum(profile_breakdown[p]["llm_latency"]) / len(profile_breakdown[p]["llm_latency"])
+                 for p in profiles]
+    tool_means = [sum(profile_breakdown[p]["tool_latency"]) / len(profile_breakdown[p]["tool_latency"])
+                  for p in profiles]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    x = range(len(profiles))
+    ax.bar(x, llm_means, label="LLM Inference", color="#3498db")
+    ax.bar(x, tool_means, bottom=llm_means, label="MCP Tool Execution", color="#e67e22")
+
+    ax.set_xlabel("Network Profile")
+    ax.set_ylabel("Average Session Latency (seconds)")
+    ax.set_title("MCP Agent Latency Breakdown by Network Profile")
+    ax.set_xticks(x)
+    ax.set_xticklabels(profiles, fontsize=8, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+
+    for i, (l, t) in enumerate(zip(llm_means, tool_means)):
+        total = l + t
+        ax.text(i, total + 0.1, f"{total:.1f}s", ha="center", fontsize=8)
+
+    plt.tight_layout()
+    output_path = output_dir / "mcp_latency_breakdown.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return str(output_path)
+
+
+def generate_mcp_loop_factor_by_profile_chart(records: list[dict], output_dir: Path) -> str:
+    """Generate loop factor distribution across network profiles.
+
+    Shows how network conditions affect the number of agent iterations
+    (retries, additional tool calls due to timeouts, etc.).
+    """
+    if not HAS_MATPLOTLIB or not HAS_NUMPY:
+        return None
+
+    sessions: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        sid = r.get("session_id")
+        if sid:
+            sessions[sid].append(r)
+
+    # Collect loop factors per profile per scenario
+    data: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for sid, recs in sessions.items():
+        profile = recs[0].get("network_profile", "unknown")
+        scenario = recs[0].get("scenario_id", "unknown")
+        n_calls = len(recs)
+        data[scenario][profile].append(n_calls)
+
+    if not data:
+        return None
+
+    scenarios = sorted(data.keys())
+    all_profiles = sorted({p for s in data.values() for p in s.keys()})
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    n_scenarios = len(scenarios)
+    n_profiles = len(all_profiles)
+    bar_width = 0.8 / n_scenarios
+    colors = plt.cm.Set2(np.linspace(0, 1, n_scenarios))
+
+    for i, scenario in enumerate(scenarios):
+        means = []
+        stds = []
+        for p in all_profiles:
+            vals = data[scenario].get(p, [])
+            means.append(np.mean(vals) if vals else 0)
+            stds.append(np.std(vals) if vals else 0)
+
+        positions = [j + i * bar_width for j in range(n_profiles)]
+        label = format_scenario_label(scenario, records)
+        ax.bar(positions, means, bar_width, yerr=stds, label=label,
+               color=colors[i], capsize=3, alpha=0.85)
+
+    ax.set_xlabel("Network Profile")
+    ax.set_ylabel("Loop Factor (calls per session)")
+    ax.set_title("MCP Loop Factor by Network Profile and Scenario")
+    center_offset = (n_scenarios - 1) * bar_width / 2
+    ax.set_xticks([j + center_offset for j in range(n_profiles)])
+    ax.set_xticklabels(all_profiles, fontsize=8, rotation=45, ha="right")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "mcp_loop_factor_by_profile.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return str(output_path)
+
+
+# =========================================================================
+# MCP & LLM Performance Charts
+# =========================================================================
+
+
+def generate_tool_latency_cdf_chart(records: list[dict], output_dir: Path) -> str:
+    """Generate CDF of tool call latency per tool name."""
+    if not HAS_MATPLOTLIB or not HAS_NUMPY:
+        return None
+
+    tool_latencies: dict[str, list[float]] = defaultdict(list)
+    for r in records:
+        meta = _parse_metadata(r)
+        if meta.get("type") == "mcp_tool_call":
+            lat = r.get("tool_latency_sec", 0) or 0
+            name = meta.get("tool_name", "unknown")
+            if lat > 0:
+                tool_latencies[name].append(lat)
+
+    if not tool_latencies:
+        return None
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    colors = plt.cm.tab10(np.linspace(0, 1, min(len(tool_latencies), 10)))
+
+    for i, (name, lats) in enumerate(sorted(tool_latencies.items())):
+        sorted_lats = np.sort(lats)
+        cdf = np.arange(1, len(sorted_lats) + 1) / len(sorted_lats)
+        ax.plot(sorted_lats * 1000, cdf, label=f"{name} (n={len(lats)})",
+                color=colors[i % len(colors)], linewidth=2)
+
+    ax.set_xlabel("Tool Latency (ms)")
+    ax.set_ylabel("CDF")
+    ax.set_title("MCP Tool Call Latency CDF by Tool")
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(alpha=0.3)
+    ax.axhline(y=0.95, color="red", linestyle="--", alpha=0.5, label="P95")
+    ax.set_ylim(0, 1.02)
+
+    plt.tight_layout()
+    output_path = output_dir / "tool_latency_cdf.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_mcp_protocol_overhead_chart(records: list[dict], output_dir: Path) -> str:
+    """Compare MCP stdio bytes vs backend HTTP bytes per tool.
+
+    Shows how much the MCP JSON-RPC framing adds on top of the actual
+    backend HTTP traffic to Spotify/Brave/etc.
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    tool_data: dict[str, dict] = defaultdict(lambda: {
+        "stdio_bytes": [], "backend_bytes": []
+    })
+
+    for r in records:
+        meta = _parse_metadata(r)
+        if meta.get("type") != "mcp_tool_call":
+            continue
+        name = meta.get("tool_name", "unknown")
+        stdio = (meta.get("mcp_stdio_request_bytes", 0) or 0) + \
+                (meta.get("mcp_stdio_response_bytes", 0) or 0)
+        backend = (meta.get("backend_total_request_bytes", 0) or 0) + \
+                  (meta.get("backend_total_response_bytes", 0) or 0)
+        if stdio > 0 or backend > 0:
+            tool_data[name]["stdio_bytes"].append(stdio)
+            tool_data[name]["backend_bytes"].append(backend)
+
+    if not tool_data:
+        return None
+
+    tools = sorted(tool_data.keys())
+    stdio_means = [np.mean(tool_data[t]["stdio_bytes"]) / 1024 for t in tools]
+    backend_means = [np.mean(tool_data[t]["backend_bytes"]) / 1024 for t in tools]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    x = range(len(tools))
+    bar_width = 0.35
+    ax1.bar([i - bar_width / 2 for i in x], stdio_means, bar_width,
+            label="MCP stdio (JSON-RPC)", color="#3498db")
+    ax1.bar([i + bar_width / 2 for i in x], backend_means, bar_width,
+            label="Backend HTTP", color="#e67e22")
+    ax1.set_xlabel("Tool")
+    ax1.set_ylabel("Average Bytes (KB)")
+    ax1.set_title("MCP Protocol vs Backend Traffic per Tool")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(tools, fontsize=7, rotation=45, ha="right")
+    ax1.legend(fontsize=8)
+    ax1.grid(axis="y", alpha=0.3)
+
+    # Overhead ratio
+    overhead_pct = []
+    for s, b in zip(stdio_means, backend_means):
+        if b > 0:
+            overhead_pct.append(((s - b) / b) * 100)
+        else:
+            overhead_pct.append(0)
+
+    bars = ax2.bar(x, overhead_pct, color=["#e74c3c" if v > 0 else "#2ecc71" for v in overhead_pct])
+    ax2.set_xlabel("Tool")
+    ax2.set_ylabel("MCP Overhead (%)")
+    ax2.set_title("MCP Protocol Overhead vs Backend")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(tools, fontsize=7, rotation=45, ha="right")
+    ax2.axhline(y=0, color="black", linewidth=0.5)
+    ax2.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "mcp_protocol_overhead.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_tool_success_rate_chart(records: list[dict], output_dir: Path) -> str:
+    """Generate success/failure rate per MCP tool name."""
+    if not HAS_MATPLOTLIB:
+        return None
+
+    tool_stats: dict[str, dict] = defaultdict(lambda: {
+        "success": 0, "fail": 0, "rate_limited": 0, "timeout": 0
+    })
+
+    for r in records:
+        meta = _parse_metadata(r)
+        if meta.get("type") != "mcp_tool_call":
+            continue
+        name = meta.get("tool_name", "unknown")
+        if r.get("success"):
+            tool_stats[name]["success"] += 1
+        else:
+            tool_stats[name]["fail"] += 1
+            err = r.get("error_type", "")
+            if "rate" in str(err).lower():
+                tool_stats[name]["rate_limited"] += 1
+            elif "timeout" in str(err).lower():
+                tool_stats[name]["timeout"] += 1
+
+    if not tool_stats:
+        return None
+
+    tools = sorted(tool_stats.keys())
+    successes = [tool_stats[t]["success"] for t in tools]
+    fails = [tool_stats[t]["fail"] for t in tools]
+    totals = [s + f for s, f in zip(successes, fails)]
+    success_pcts = [(s / t * 100) if t > 0 else 0 for s, t in zip(successes, totals)]
+    rate_limited = [tool_stats[t]["rate_limited"] for t in tools]
+    timeouts = [tool_stats[t]["timeout"] for t in tools]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    colors = ["#2ecc71" if p >= 95 else "#f39c12" if p >= 80 else "#e74c3c" for p in success_pcts]
+    ax1.bar(range(len(tools)), success_pcts, color=colors)
+    ax1.set_xlabel("Tool")
+    ax1.set_ylabel("Success Rate (%)")
+    ax1.set_title("MCP Tool Success Rate")
+    ax1.set_xticks(range(len(tools)))
+    ax1.set_xticklabels(tools, fontsize=7, rotation=45, ha="right")
+    ax1.set_ylim(0, 105)
+    ax1.axhline(y=95, color="green", linestyle="--", alpha=0.3)
+    ax1.grid(axis="y", alpha=0.3)
+    for i, (p, t) in enumerate(zip(success_pcts, totals)):
+        ax1.text(i, p + 1, f"{p:.0f}%\n(n={t})", ha="center", fontsize=7)
+
+    x = range(len(tools))
+    other_fails = [f - rl - to for f, rl, to in zip(fails, rate_limited, timeouts)]
+    ax2.bar(x, rate_limited, label="Rate Limited", color="#f39c12")
+    ax2.bar(x, timeouts, bottom=rate_limited, label="Timeout", color="#e74c3c")
+    ax2.bar(x, other_fails, bottom=[rl + to for rl, to in zip(rate_limited, timeouts)],
+            label="Other", color="#95a5a6")
+    ax2.set_xlabel("Tool")
+    ax2.set_ylabel("Failure Count")
+    ax2.set_title("MCP Tool Failure Breakdown")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(tools, fontsize=7, rotation=45, ha="right")
+    ax2.legend(fontsize=8)
+    ax2.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "tool_success_rate.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_agent_session_waterfall_chart(records: list[dict], output_dir: Path) -> str:
+    """Generate waterfall timeline of a sample agent session.
+
+    Picks a representative session and plots each LLM call and tool call
+    as horizontal bars on a timeline.
+    """
+    if not HAS_MATPLOTLIB:
+        return None
+
+    # Group by session, pick sessions with tool calls
+    sessions: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        sid = r.get("session_id")
+        if sid:
+            sessions[sid].append(r)
+
+    # Find a session with mixed LLM + tool calls
+    candidate = None
+    for sid, recs in sessions.items():
+        has_tool = any(_parse_metadata(r).get("type") == "mcp_tool_call" for r in recs)
+        has_llm = any(_parse_metadata(r).get("type") == "llm_api_call" for r in recs)
+        if has_tool and has_llm and len(recs) >= 3:
+            candidate = (sid, recs)
+            break
+
+    if not candidate:
+        return None
+
+    sid, recs = candidate
+    recs.sort(key=lambda r: r.get("t_request_start", 0) or r.get("timestamp", 0))
+
+    # Find session start time
+    t0 = min(r.get("t_request_start", 0) or r.get("timestamp", 0) for r in recs)
+
+    fig, ax = plt.subplots(figsize=(14, max(4, len(recs) * 0.5)))
+
+    colors_map = {"llm_api_call": "#3498db", "mcp_tool_call": "#e67e22"}
+    y_labels = []
+
+    for i, r in enumerate(recs):
+        meta = _parse_metadata(r)
+        rec_type = meta.get("type", "llm_api_call")
+        start = (r.get("t_request_start", 0) or r.get("timestamp", 0)) - t0
+        duration = r.get("latency_sec", 0) or r.get("tool_latency_sec", 0) or 0
+
+        color = colors_map.get(rec_type, "#95a5a6")
+        ax.barh(i, duration, left=start, height=0.6, color=color, alpha=0.85, edgecolor="white")
+
+        if rec_type == "mcp_tool_call":
+            tool_name = meta.get("tool_name", "tool")
+            y_labels.append(f"Tool: {tool_name}")
+            ax.text(start + duration + 0.05, i, f"{duration:.2f}s", va="center", fontsize=7)
+        else:
+            iteration = meta.get("iteration", "?")
+            y_labels.append(f"LLM call #{iteration}")
+            tokens = r.get("tokens_out", 0) or 0
+            ax.text(start + duration + 0.05, i, f"{duration:.2f}s ({tokens} tok)",
+                    va="center", fontsize=7)
+
+    ax.set_yticks(range(len(y_labels)))
+    ax.set_yticklabels(y_labels, fontsize=8)
+    ax.set_xlabel("Time (seconds from session start)")
+    scenario = recs[0].get("scenario_id", "unknown")
+    profile = recs[0].get("network_profile", "unknown")
+    ax.set_title(f"Agent Session Waterfall — {scenario} / {profile}")
+    ax.invert_yaxis()
+    ax.grid(axis="x", alpha=0.3)
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#3498db", label="LLM API Call"),
+        Patch(facecolor="#e67e22", label="MCP Tool Call"),
+    ]
+    ax.legend(handles=legend_elements, fontsize=8, loc="lower right")
+
+    plt.tight_layout()
+    output_path = output_dir / "agent_session_waterfall.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_all_agent_waterfall_charts(records: list[dict], output_dir: Path) -> dict[str, str]:
+    """Generate one waterfall chart per agent scenario.
+
+    Returns a dict mapping scenario_id to the chart file path.
+    """
+    if not HAS_MATPLOTLIB:
+        return {}
+
+    from matplotlib.patches import Patch
+
+    # Group all records by session
+    sessions: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        sid = r.get("session_id")
+        if sid:
+            sessions[sid].append(r)
+
+    # Find best session per scenario (has tool calls, prefer ideal_6g, latest)
+    best_per_scenario: dict[str, tuple[str, list[dict]]] = {}
+    for sid, recs in sessions.items():
+        has_tool = any(_parse_metadata(r).get("type") == "mcp_tool_call" for r in recs)
+        has_llm = any(_parse_metadata(r).get("type") == "llm_api_call" for r in recs)
+        if not (has_tool and has_llm and len(recs) >= 3):
+            continue
+
+        scenario = recs[0].get("scenario_id", "unknown")
+        profile = recs[0].get("network_profile", "")
+        max_ts = max(r.get("timestamp", 0) for r in recs)
+
+        prev = best_per_scenario.get(scenario)
+        if prev is None:
+            best_per_scenario[scenario] = (sid, recs)
+        else:
+            prev_profile = prev[1][0].get("network_profile", "")
+            prev_ts = max(r.get("timestamp", 0) for r in prev[1])
+            # Prefer ideal_6g, then latest
+            if profile == "ideal_6g" and prev_profile != "ideal_6g":
+                best_per_scenario[scenario] = (sid, recs)
+            elif profile == prev_profile and max_ts > prev_ts:
+                best_per_scenario[scenario] = (sid, recs)
+
+    waterfall_dir = output_dir / "waterfalls"
+    waterfall_dir.mkdir(parents=True, exist_ok=True)
+
+    generated = {}
+    colors_map = {"llm_api_call": "#3498db", "mcp_tool_call": "#e67e22"}
+
+    for scenario, (sid, recs) in sorted(best_per_scenario.items()):
+        recs.sort(key=lambda r: r.get("t_request_start", 0) or r.get("timestamp", 0))
+        t0 = min(r.get("t_request_start", 0) or r.get("timestamp", 0) for r in recs)
+        profile = recs[0].get("network_profile", "unknown")
+
+        fig, ax = plt.subplots(figsize=(14, max(4, len(recs) * 0.45)))
+
+        y_labels = []
+        for i, r in enumerate(recs):
+            meta = _parse_metadata(r)
+            rec_type = meta.get("type", "llm_api_call")
+            start = (r.get("t_request_start", 0) or r.get("timestamp", 0)) - t0
+            duration = r.get("latency_sec", 0) or r.get("tool_latency_sec", 0) or 0
+
+            color = colors_map.get(rec_type, "#95a5a6")
+            ax.barh(i, duration, left=start, height=0.6, color=color, alpha=0.85, edgecolor="white")
+
+            if rec_type == "mcp_tool_call":
+                tool_name = meta.get("tool_name", "tool")
+                y_labels.append(f"Tool: {tool_name}")
+                ax.text(start + duration + 0.05, i, f"{duration:.2f}s", va="center", fontsize=7)
+            else:
+                iteration = meta.get("iteration", "?")
+                y_labels.append(f"LLM #{iteration}")
+                tokens = r.get("tokens_out", 0) or 0
+                ax.text(start + duration + 0.05, i, f"{duration:.2f}s ({tokens} tok)",
+                        va="center", fontsize=7)
+
+        ax.set_yticks(range(len(y_labels)))
+        ax.set_yticklabels(y_labels, fontsize=8)
+        ax.set_xlabel("Time (seconds from session start)")
+
+        scenario_label = format_scenario_label(scenario, recs, include_provider=True)
+        ax.set_title(f"Agent Session Waterfall — {scenario_label} / {profile}")
+        ax.invert_yaxis()
+        ax.grid(axis="x", alpha=0.3)
+
+        legend_elements = [
+            Patch(facecolor="#3498db", label="LLM API Call"),
+            Patch(facecolor="#e67e22", label="MCP Tool Call"),
+        ]
+        ax.legend(handles=legend_elements, fontsize=8, loc="lower right")
+
+        plt.tight_layout()
+        output_path = waterfall_dir / f"waterfall_{scenario}.png"
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        generated[scenario] = str(output_path)
+
+    return generated
+
+
+def generate_token_rate_by_profile_chart(records: list[dict], output_dir: Path) -> str:
+    """Generate token generation rate (tokens/sec) across network profiles."""
+    if not HAS_MATPLOTLIB or not HAS_NUMPY:
+        return None
+
+    profile_rates: dict[str, list[float]] = defaultdict(list)
+    for r in records:
+        meta = _parse_metadata(r)
+        if meta.get("type") == "mcp_tool_call":
+            continue
+        tokens_out = r.get("tokens_out", 0) or 0
+        latency = r.get("latency_sec", 0) or 0
+        if tokens_out > 0 and latency > 0:
+            profile = r.get("network_profile", "unknown")
+            profile_rates[profile].append(tokens_out / latency)
+
+    if not profile_rates:
+        return None
+
+    profiles = sorted(profile_rates.keys())
+    means = [np.mean(profile_rates[p]) for p in profiles]
+    stds = [np.std(profile_rates[p]) for p in profiles]
+    p95s = [np.percentile(profile_rates[p], 95) for p in profiles]
+    p5s = [np.percentile(profile_rates[p], 5) for p in profiles]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    x = range(len(profiles))
+    ax1.bar(x, means, yerr=stds, color="#3498db", capsize=4, alpha=0.85)
+    ax1.set_xlabel("Network Profile")
+    ax1.set_ylabel("Observed Token Rate (tokens/sec)")
+    ax1.set_title("Observed Token Arrival Rate by Network Profile (Client-Side)")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(profiles, fontsize=8, rotation=45, ha="right")
+    ax1.grid(axis="y", alpha=0.3)
+
+    # Box plot
+    box_data = [profile_rates[p] for p in profiles]
+    bp = ax2.boxplot(box_data, labels=profiles, patch_artist=True)
+    for patch in bp["boxes"]:
+        patch.set_facecolor("#3498db")
+        patch.set_alpha(0.6)
+    ax2.set_xlabel("Network Profile")
+    ax2.set_ylabel("Observed Token Rate (tokens/sec)")
+    ax2.set_title("Token Arrival Rate Distribution")
+    ax2.tick_params(axis="x", rotation=45)
+    ax2.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "token_rate_by_profile.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_context_growth_chart(records: list[dict], output_dir: Path) -> str:
+    """Show how context (tokens_in) grows across agent turns within sessions."""
+    if not HAS_MATPLOTLIB:
+        return None
+
+    sessions: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        sid = r.get("session_id")
+        if sid:
+            sessions[sid].append(r)
+
+    scenario_turns: dict[str, list[list[int]]] = defaultdict(list)
+    for sid, recs in sessions.items():
+        llm_recs = [r for r in recs if _parse_metadata(r).get("type") != "mcp_tool_call"]
+        llm_recs.sort(key=lambda r: r.get("t_request_start", 0) or r.get("timestamp", 0))
+        if len(llm_recs) < 2:
+            continue
+        tokens_per_turn = [r.get("tokens_in", 0) or 0 for r in llm_recs]
+        scenario = recs[0].get("scenario_id", "unknown")
+        scenario_turns[scenario].append(tokens_per_turn)
+
+    if not scenario_turns:
+        return None
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    colors = plt.cm.tab10(np.linspace(0, 1, min(len(scenario_turns), 10)))
+
+    for i, (scenario, all_turns) in enumerate(sorted(scenario_turns.items())):
+        max_len = max(len(t) for t in all_turns)
+        avg_per_turn = []
+        for turn_idx in range(max_len):
+            vals = [t[turn_idx] for t in all_turns if turn_idx < len(t)]
+            avg_per_turn.append(np.mean(vals) if vals else 0)
+
+        label = format_scenario_label(scenario)
+        ax.plot(range(1, len(avg_per_turn) + 1), avg_per_turn,
+                marker="o", label=label, color=colors[i % len(colors)], linewidth=2)
+
+    ax.set_xlabel("LLM Call # (within session)")
+    ax.set_ylabel("Input Tokens (context size)")
+    ax.set_title("Context Window Growth Across Agent Turns")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "context_growth.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_request_response_scatter_chart(records: list[dict], output_dir: Path) -> str:
+    """Scatter plot of request bytes vs response bytes per record."""
+    if not HAS_MATPLOTLIB or not HAS_NUMPY:
+        return None
+
+    llm_req, llm_resp = [], []
+    tool_req, tool_resp = [], []
+
+    for r in records:
+        req = r.get("request_bytes", 0) or 0
+        resp = r.get("response_bytes", 0) or 0
+        if req <= 0 and resp <= 0:
+            continue
+        meta = _parse_metadata(r)
+        if meta.get("type") == "mcp_tool_call":
+            tool_req.append(req / 1024)
+            tool_resp.append(resp / 1024)
+        else:
+            llm_req.append(req / 1024)
+            llm_resp.append(resp / 1024)
+
+    if not llm_req and not tool_req:
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    if llm_req:
+        ax.scatter(llm_req, llm_resp, alpha=0.5, s=30, color="#3498db", label="LLM API", zorder=2)
+    if tool_req:
+        ax.scatter(tool_req, tool_resp, alpha=0.5, s=30, color="#e67e22", label="MCP Tool", zorder=2)
+
+    all_vals = llm_req + llm_resp + tool_req + tool_resp
+    if all_vals:
+        max_val = max(all_vals) * 1.1
+        ax.plot([0, max_val], [0, max_val], "k--", alpha=0.2, label="1:1 ratio")
+
+    ax.set_xlabel("Request Size (KB)")
+    ax.set_ylabel("Response Size (KB)")
+    ax.set_title("Request vs Response Size (UL/DL Asymmetry)")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "request_response_scatter.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_ttft_vs_latency_chart(records: list[dict], output_dir: Path) -> str:
+    """Scatter plot of TTFT vs total latency to see correlation."""
+    if not HAS_MATPLOTLIB or not HAS_NUMPY:
+        return None
+
+    ttfts, latencies, profiles = [], [], []
+    for r in records:
+        t_start = r.get("t_request_start", 0) or 0
+        t_first = r.get("t_first_token", 0) or 0
+        lat = r.get("latency_sec", 0) or 0
+        if t_start > 0 and t_first > 0 and lat > 0:
+            ttft = t_first - t_start
+            if 0 < ttft < lat:
+                ttfts.append(ttft)
+                latencies.append(lat)
+                profiles.append(r.get("network_profile", "unknown"))
+
+    if len(ttfts) < 2:
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    unique_profiles = sorted(set(profiles))
+    colors = plt.cm.tab10(np.linspace(0, 1, min(len(unique_profiles), 10)))
+    profile_colors = {p: colors[i % len(colors)] for i, p in enumerate(unique_profiles)}
+
+    for p in unique_profiles:
+        p_ttfts = [t for t, pr in zip(ttfts, profiles) if pr == p]
+        p_lats = [l for l, pr in zip(latencies, profiles) if pr == p]
+        ax.scatter(p_ttfts, p_lats, alpha=0.6, s=30, color=profile_colors[p],
+                   label=p, zorder=2)
+
+    # Correlation line
+    ttft_arr = np.array(ttfts)
+    lat_arr = np.array(latencies)
+    if len(ttft_arr) > 2:
+        z = np.polyfit(ttft_arr, lat_arr, 1)
+        p_line = np.poly1d(z)
+        x_line = np.linspace(min(ttfts), max(ttfts), 100)
+        ax.plot(x_line, p_line(x_line), "r--", alpha=0.5, linewidth=2)
+        corr = np.corrcoef(ttft_arr, lat_arr)[0, 1]
+        ax.text(0.05, 0.95, f"r = {corr:.3f}", transform=ax.transAxes,
+                fontsize=10, va="top", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+    ax.set_xlabel("Time to First Token (seconds)")
+    ax.set_ylabel("Total Latency (seconds)")
+    ax.set_title("TTFT vs Total Latency Correlation")
+    ax.legend(fontsize=7, loc="lower right")
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "ttft_vs_latency.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_inter_turn_idle_chart(records: list[dict], output_dir: Path) -> str:
+    """Show idle time between consecutive calls within agent sessions.
+
+    Reveals client-side processing overhead between LLM response and next request.
+    """
+    if not HAS_MATPLOTLIB or not HAS_NUMPY:
+        return None
+
+    sessions: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        sid = r.get("session_id")
+        if sid:
+            sessions[sid].append(r)
+
+    profile_gaps: dict[str, list[float]] = defaultdict(list)
+    for sid, recs in sessions.items():
+        recs.sort(key=lambda r: r.get("t_request_start", 0) or r.get("timestamp", 0))
+        profile = recs[0].get("network_profile", "unknown")
+
+        for i in range(1, len(recs)):
+            prev_end = (recs[i - 1].get("t_request_start", 0) or 0) + \
+                       (recs[i - 1].get("latency_sec", 0) or recs[i - 1].get("tool_latency_sec", 0) or 0)
+            curr_start = recs[i].get("t_request_start", 0) or recs[i].get("timestamp", 0)
+            gap = curr_start - prev_end
+            if 0 < gap < 30:  # Filter out unreasonable gaps
+                profile_gaps[profile].append(gap * 1000)  # Convert to ms
+
+    if not profile_gaps:
+        return None
+
+    profiles = sorted(profile_gaps.keys())
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Bar chart of mean idle time
+    means = [np.mean(profile_gaps[p]) for p in profiles]
+    p95s = [np.percentile(profile_gaps[p], 95) for p in profiles]
+    x = range(len(profiles))
+    bar_width = 0.35
+    ax1.bar([i - bar_width / 2 for i in x], means, bar_width, label="Mean", color="#3498db")
+    ax1.bar([i + bar_width / 2 for i in x], p95s, bar_width, label="P95", color="#e74c3c")
+    ax1.set_xlabel("Network Profile")
+    ax1.set_ylabel("Idle Time (ms)")
+    ax1.set_title("Inter-Turn Idle Time (Client Processing)")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(profiles, fontsize=8, rotation=45, ha="right")
+    ax1.legend(fontsize=8)
+    ax1.grid(axis="y", alpha=0.3)
+
+    # Box plot
+    box_data = [profile_gaps[p] for p in profiles]
+    bp = ax2.boxplot(box_data, labels=profiles, patch_artist=True)
+    for patch in bp["boxes"]:
+        patch.set_facecolor("#3498db")
+        patch.set_alpha(0.6)
+    ax2.set_xlabel("Network Profile")
+    ax2.set_ylabel("Idle Time (ms)")
+    ax2.set_title("Inter-Turn Idle Time Distribution")
+    ax2.tick_params(axis="x", rotation=45)
+    ax2.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "inter_turn_idle.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_degradation_heatmap_chart(records: list[dict], output_dir: Path) -> str:
+    """Heatmap: scenarios x profiles, color = % degradation from best profile."""
+    if not HAS_MATPLOTLIB or not HAS_NUMPY:
+        return None
+
+    # Compute mean latency per scenario+profile
+    sp_latencies: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for r in records:
+        lat = r.get("latency_sec", 0) or 0
+        if lat > 0:
+            scenario = r.get("scenario_id", "unknown")
+            profile = r.get("network_profile", "unknown")
+            sp_latencies[scenario][profile].append(lat)
+
+    if not sp_latencies:
+        return None
+
+    scenarios = sorted(sp_latencies.keys())
+    all_profiles = sorted({p for s in sp_latencies.values() for p in s.keys()})
+
+    if len(scenarios) < 1 or len(all_profiles) < 2:
+        return None
+
+    # Build matrix: % increase from baseline (min latency profile)
+    matrix = np.zeros((len(scenarios), len(all_profiles)))
+    for i, scenario in enumerate(scenarios):
+        profile_means = {}
+        for j, profile in enumerate(all_profiles):
+            lats = sp_latencies[scenario].get(profile, [])
+            profile_means[profile] = np.mean(lats) if lats else np.nan
+        baseline = np.nanmin(list(profile_means.values()))
+        for j, profile in enumerate(all_profiles):
+            val = profile_means.get(profile, np.nan)
+            if baseline > 0 and not np.isnan(val):
+                matrix[i, j] = ((val - baseline) / baseline) * 100
+            else:
+                matrix[i, j] = np.nan
+
+    fig, ax = plt.subplots(figsize=(max(10, len(all_profiles) * 1.5),
+                                    max(5, len(scenarios) * 0.6)))
+
+    masked = np.ma.masked_invalid(matrix)
+    cmap = plt.cm.YlOrRd
+    cmap.set_bad(color="lightgray")
+    im = ax.imshow(masked, aspect="auto", cmap=cmap)
+
+    ax.set_xticks(range(len(all_profiles)))
+    ax.set_xticklabels(all_profiles, fontsize=8, rotation=45, ha="right")
+    scenario_labels = [format_scenario_label(s) for s in scenarios]
+    ax.set_yticks(range(len(scenarios)))
+    ax.set_yticklabels(scenario_labels, fontsize=8)
+    ax.set_title("Latency Degradation from Best Profile (%)")
+
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label("Degradation (%)")
+
+    for i in range(len(scenarios)):
+        for j in range(len(all_profiles)):
+            val = matrix[i, j]
+            if not np.isnan(val):
+                color = "white" if val > 50 else "black"
+                ax.text(j, i, f"{val:.0f}%", ha="center", va="center",
+                        fontsize=7, color=color)
+
+    plt.tight_layout()
+    output_path = output_dir / "degradation_heatmap.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_success_vs_latency_chart(records: list[dict], output_dir: Path) -> str:
+    """Scatter of success rate vs mean latency per scenario+profile bucket."""
+    if not HAS_MATPLOTLIB:
+        return None
+
+    buckets: dict[str, dict] = defaultdict(lambda: {"success": 0, "total": 0, "latencies": []})
+    for r in records:
+        scenario = r.get("scenario_id", "unknown")
+        profile = r.get("network_profile", "unknown")
+        key = f"{scenario}|{profile}"
+        buckets[key]["total"] += 1
+        if r.get("success"):
+            buckets[key]["success"] += 1
+        lat = r.get("latency_sec", 0) or 0
+        if lat > 0:
+            buckets[key]["latencies"].append(lat)
+        buckets[key]["profile"] = profile
+        buckets[key]["scenario"] = scenario
+
+    if not buckets:
+        return None
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    unique_profiles = sorted({b["profile"] for b in buckets.values()})
+    colors = plt.cm.tab10(np.linspace(0, 1, min(len(unique_profiles), 10)))
+    profile_colors = {p: colors[i % len(colors)] for i, p in enumerate(unique_profiles)}
+
+    for key, b in buckets.items():
+        if not b["latencies"]:
+            continue
+        mean_lat = np.mean(b["latencies"])
+        success_rate = (b["success"] / b["total"] * 100) if b["total"] > 0 else 0
+        ax.scatter(mean_lat, success_rate, s=b["total"] * 3,
+                   color=profile_colors[b["profile"]], alpha=0.7, edgecolors="white",
+                   linewidth=0.5, zorder=2)
+
+    # Legend for profiles
+    for p in unique_profiles:
+        ax.scatter([], [], color=profile_colors[p], label=p, s=50)
+
+    ax.set_xlabel("Mean Latency (seconds)")
+    ax.set_ylabel("Success Rate (%)")
+    ax.set_title("Success Rate vs Latency (bubble size = sample count)")
+    ax.legend(fontsize=7, loc="lower left")
+    ax.set_ylim(-5, 105)
+    ax.grid(alpha=0.3)
+    ax.axhline(y=95, color="green", linestyle="--", alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "success_vs_latency.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def generate_mcp_transport_comparison_chart(records: list[dict], output_dir: Path) -> str:
+    """Compare MCP stdio vs HTTP transport if both are present in the data."""
+    if not HAS_MATPLOTLIB:
+        return None
+
+    transport_data: dict[str, dict[str, list[float]]] = defaultdict(lambda: {
+        "latency": [], "bytes": []
+    })
+
+    for r in records:
+        meta = _parse_metadata(r)
+        if meta.get("type") != "mcp_tool_call":
+            continue
+        transport = meta.get("transport", "stdio")
+        lat = r.get("tool_latency_sec", 0) or 0
+        total_bytes = (r.get("request_bytes", 0) or 0) + (r.get("response_bytes", 0) or 0)
+        if lat > 0:
+            transport_data[transport]["latency"].append(lat * 1000)  # ms
+            transport_data[transport]["bytes"].append(total_bytes / 1024)  # KB
+
+    if len(transport_data) < 2:
+        return None
+
+    transports = sorted(transport_data.keys())
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Latency comparison box plot
+    lat_data = [transport_data[t]["latency"] for t in transports]
+    bp1 = ax1.boxplot(lat_data, labels=transports, patch_artist=True)
+    colors_t = ["#3498db", "#e67e22"]
+    for patch, color in zip(bp1["boxes"], colors_t):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+    ax1.set_xlabel("MCP Transport")
+    ax1.set_ylabel("Tool Latency (ms)")
+    ax1.set_title("MCP Transport: Latency Comparison")
+    ax1.grid(axis="y", alpha=0.3)
+
+    # Bytes comparison box plot
+    byte_data = [transport_data[t]["bytes"] for t in transports]
+    bp2 = ax2.boxplot(byte_data, labels=transports, patch_artist=True)
+    for patch, color in zip(bp2["boxes"], colors_t):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+    ax2.set_xlabel("MCP Transport")
+    ax2.set_ylabel("Traffic per Call (KB)")
+    ax2.set_title("MCP Transport: Traffic Comparison")
+    ax2.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / "mcp_transport_comparison.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return str(output_path)
+
+
+def _classify_error(error_type: str) -> str:
+    """Classify a raw error string into a short category."""
+    if not error_type:
+        return "Unknown"
+    e = error_type.lower()
+    if "timeout" in e or "timed out" in e:
+        return "Timeout"
+    if "429" in e or ("rate" in e and "limit" in e) or "too many requests" in e:
+        return "Rate Limited"
+    if "400" in e or "bad request" in e or "invalid" in e:
+        return "Bad Request"
+    if "connect" in e or "connection" in e:
+        return "Connection"
+    if "auth" in e or "401" in e or "403" in e or "api key" in e:
+        return "Auth"
+    if "500" in e or "502" in e or "503" in e or "server error" in e or "internal_error" in e:
+        return "Server Error"
+    if "keyboard" in e or "press" in e or "selector" in e or "element" in e:
+        return "Browser/UI"
+    if "mcp" in e or "tool" in e:
+        return "Tool Failure"
+    return "Other"
+
+
+# Fixed palette for error categories so colours are stable across charts
+_ERROR_PALETTE = {
+    "Timeout":      "#e74c3c",
+    "Rate Limited": "#e67e22",
+    "Bad Request":  "#f1c40f",
+    "Connection":   "#f39c12",
+    "Auth":         "#9b59b6",
+    "Server Error": "#c0392b",
+    "Browser/UI":   "#2980b9",
+    "Tool Failure": "#d35400",
+    "Unknown":      "#7f8c8d",
+    "Other":        "#95a5a6",
+}
+_ERROR_MARKERS = {
+    "Timeout":      "X",
+    "Rate Limited": "D",
+    "Bad Request":  "d",
+    "Connection":   "s",
+    "Auth":         "^",
+    "Server Error": "v",
+    "Browser/UI":   ">",
+    "Tool Failure": "P",
+    "Unknown":      "o",
+    "Other":        "h",
+}
+
+
+def _error_color(category: str) -> str:
+    return _ERROR_PALETTE.get(category, "#95a5a6")
+
+
+def _error_marker(category: str) -> str:
+    return _ERROR_MARKERS.get(category, "o")
+
+
+def generate_error_analysis_chart(records: list[dict], output_dir: Path) -> str:
+    """Generate error analysis chart with colour-coded categories and legend."""
+    if not HAS_MATPLOTLIB:
+        return None
+
+    # Classify every failure
     success_count = 0
+    error_by_category: dict[str, int] = defaultdict(int)
+    error_by_scenario: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
     for r in records:
         if r.get("success"):
             success_count += 1
         else:
-            error_type = r.get("error_type", "unknown") or "unknown"
-            error_counts[error_type] += 1
+            cat = _classify_error(r.get("error_type", ""))
+            error_by_category[cat] += 1
+            scenario = r.get("scenario_id", "unknown")
+            error_by_scenario[scenario][cat] += 1
 
-    if not error_counts:
+    if not error_by_category:
         return None
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    # Sort categories by count descending
+    sorted_cats = sorted(error_by_category.keys(), key=lambda c: error_by_category[c], reverse=True)
 
-    # Pie chart of success vs failure
-    total = success_count + sum(error_counts.values())
-    fail_count = sum(error_counts.values())
-    sizes = [success_count, fail_count]
-    labels = [f'Success\n({success_count})', f'Failed\n({fail_count})']
-    colors = ['#27ae60', '#e74c3c']
-    ax1.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-    ax1.set_title(f'Overall Success Rate (n={total})')
+    fig, axes = plt.subplots(1, 3, figsize=(20, 7),
+                             gridspec_kw={"width_ratios": [1, 1.4, 1.6]})
 
-    # Bar chart of error types
-    error_types = list(error_counts.keys())
-    counts = list(error_counts.values())
+    # --- Panel 1: Donut chart (success vs failure) ---
+    ax1 = axes[0]
+    total = success_count + sum(error_by_category.values())
+    fail_count = sum(error_by_category.values())
+    wedges, texts, autotexts = ax1.pie(
+        [success_count, fail_count],
+        labels=None,
+        colors=["#27ae60", "#e74c3c"],
+        autopct="%1.1f%%",
+        startangle=90,
+        pctdistance=0.75,
+        wedgeprops=dict(width=0.4),
+    )
+    for t in autotexts:
+        t.set_fontsize(11)
+        t.set_fontweight("bold")
+    ax1.legend(
+        [f"Success ({success_count:,})", f"Failed ({fail_count:,})"],
+        loc="lower center", fontsize=9, frameon=False,
+    )
+    ax1.set_title(f"Overall (n={total:,})", fontsize=11, fontweight="bold")
 
-    bars = ax2.barh(range(len(error_types)), counts, color='#e74c3c')
-    ax2.set_xlabel('Count')
-    ax2.set_ylabel('Error Type')
-    ax2.set_title('Failures by Error Type')
-    ax2.set_yticks(range(len(error_types)))
-    ax2.set_yticklabels(error_types)
-    ax2.grid(axis='x', alpha=0.3)
+    # --- Panel 2: Horizontal bars by error category with colour + marker ---
+    ax2 = axes[1]
+    y_pos = range(len(sorted_cats))
+    counts = [error_by_category[c] for c in sorted_cats]
+    bar_colors = [_error_color(c) for c in sorted_cats]
 
-    # Add count labels
-    for bar, count in zip(bars, counts):
-        ax2.annotate(f'{count}',
-                    xy=(bar.get_width(), bar.get_y() + bar.get_height()/2),
-                    xytext=(3, 0), textcoords="offset points",
-                    ha='left', va='center', fontsize=9)
+    bars = ax2.barh(y_pos, counts, color=bar_colors, edgecolor="white", linewidth=0.5)
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels(sorted_cats, fontsize=9)
+    ax2.invert_yaxis()
+    ax2.set_xlabel("Count")
+    ax2.set_title("Failures by Category", fontsize=11, fontweight="bold")
+    ax2.grid(axis="x", alpha=0.3)
 
+    # Add markers + count labels
+    for i, (bar, cat, count) in enumerate(zip(bars, sorted_cats, counts)):
+        marker = _error_marker(cat)
+        ax2.scatter(
+            count + max(counts) * 0.02, i,
+            marker=marker, s=60, color=_error_color(cat),
+            edgecolors="black", linewidths=0.5, zorder=5,
+        )
+        ax2.annotate(
+            f"{count}", xy=(count, i),
+            xytext=(max(counts) * 0.06, 0), textcoords="offset points",
+            ha="left", va="center", fontsize=9,
+        )
+
+    # --- Panel 3: Per-scenario stacked bars ---
+    ax3 = axes[2]
+
+    # Only show scenarios that have errors, sorted by total failures
+    scenario_totals = {s: sum(cats.values()) for s, cats in error_by_scenario.items()}
+    sorted_scenarios = sorted(scenario_totals.keys(), key=lambda s: scenario_totals[s], reverse=True)
+    # Limit to top 12 to avoid crowding
+    sorted_scenarios = sorted_scenarios[:12]
+
+    scenario_labels = [format_scenario_label(s, include_provider=False) for s in sorted_scenarios]
+    y_pos_s = range(len(sorted_scenarios))
+
+    left = [0] * len(sorted_scenarios)
+    legend_handles = []
+
+    for cat in sorted_cats:
+        widths = [error_by_scenario[s].get(cat, 0) for s in sorted_scenarios]
+        if sum(widths) == 0:
+            continue
+        color = _error_color(cat)
+        marker = _error_marker(cat)
+        ax3.barh(y_pos_s, widths, left=left, color=color,
+                 edgecolor="white", linewidth=0.5, label=cat)
+        legend_handles.append(
+            plt.Line2D([0], [0], marker=marker, color="w",
+                       markerfacecolor=color, markeredgecolor="black",
+                       markersize=8, label=cat)
+        )
+        left = [l + w for l, w in zip(left, widths)]
+
+    ax3.set_yticks(y_pos_s)
+    ax3.set_yticklabels(scenario_labels, fontsize=8)
+    ax3.invert_yaxis()
+    ax3.set_xlabel("Failure Count")
+    ax3.set_title("Failures by Scenario", fontsize=11, fontweight="bold")
+    ax3.grid(axis="x", alpha=0.3)
+    ax3.legend(handles=legend_handles, loc="lower right", fontsize=8,
+               framealpha=0.9, title="Error Type", title_fontsize=9)
+
+    fig.suptitle("Error Analysis", fontsize=13, fontweight="bold", y=1.01)
     plt.tight_layout()
     output_path = output_dir / "error_analysis.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -1070,7 +2508,7 @@ def generate_latency_by_profile_chart(records: list[dict], output_dir: Path) -> 
 
     plt.tight_layout()
     output_path = output_dir / "latency_by_profile.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -1108,19 +2546,20 @@ def generate_tokens_chart(records: list[dict], output_dir: Path) -> str:
     bars2 = ax.bar([i + width/2 for i in x], tokens_out, width, label='Output Tokens', color='#e74c3c')
 
     ax.set_xlabel('Scenario')
-    ax.set_ylabel('Token Count')
+    ax.set_ylabel('Token Count (log scale)')
     ax.set_title('Average Token Counts by Scenario')
     ax.set_xticks(x)
     label_text = [label.replace(" - ", "\n") for label in scenarios]
     ax.set_xticklabels(label_text, fontsize=7, rotation=55, ha='right')
     ax.tick_params(axis='x', labelrotation=55)
+    ax.set_yscale('log')
     ax.legend()
     ax.grid(axis='y', alpha=0.3)
 
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.35)
     output_path = output_dir / "token_counts.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -1189,7 +2628,7 @@ def generate_ttft_heatmap(records: list[dict], output_dir: Path) -> str:
 
     plt.tight_layout()
     output_path = output_dir / "ttft_heatmap.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -1252,7 +2691,7 @@ def generate_pcap_rtt_chart(pcap_metrics: list, output_dir: Path) -> str:
 
     plt.tight_layout()
     output_path = output_dir / "pcap_rtt_analysis.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -1309,7 +2748,7 @@ def generate_pcap_throughput_chart(pcap_metrics: list, output_dir: Path) -> str:
 
     plt.tight_layout()
     output_path = output_dir / "pcap_throughput.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -1371,7 +2810,7 @@ def generate_pcap_retransmission_chart(pcap_metrics: list, output_dir: Path) -> 
 
     plt.tight_layout()
     output_path = output_dir / "pcap_retransmissions.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -1469,7 +2908,7 @@ def generate_pcap_summary_chart(pcap_metrics: list, output_dir: Path) -> str:
 
     plt.tight_layout()
     output_path = output_dir / "pcap_summary.png"
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     return str(output_path)
@@ -1484,7 +2923,7 @@ def main():
     parser.add_argument("--db", default="logs/traffic_logs.db", help="Path to SQLite database")
     parser.add_argument("--all-runs", action="store_true", help="Include all runs instead of latest per scenario")
     parser.add_argument("--run-gap-sec", type=float, default=300.0, help="Gap in seconds to split runs per scenario")
-    parser.add_argument("--output-dir", default="reports/figures", help="Output directory for charts")
+    parser.add_argument("--output-dir", default="results/reports/figures", help="Output directory for charts")
     parser.add_argument("--pcap-dir", default=None, help="Directory containing pcap files for network-layer analysis")
     args = parser.parse_args()
 
@@ -1516,6 +2955,12 @@ def main():
         print("No data found in database!")
         return
 
+    # Split into success-only (for latency/throughput/token charts) and all records
+    # (for success rate/error charts). This prevents failed requests with fast error
+    # times from skewing latency averages downward.
+    success_records = [r for r in records if r.get("success")]
+    print(f"  Success-only records: {len(success_records)}/{len(records)}")
+
     if not HAS_MATPLOTLIB:
         print("ERROR: matplotlib is required. Install with: pip install matplotlib seaborn")
         return
@@ -1529,89 +2974,177 @@ def main():
 
     print("\nGenerating charts...")
 
-    # Generate each chart
-    path = generate_latency_by_scenario(records, output_dir)
+    # Generate each chart.
+    # Most charts use success_records to avoid failed requests skewing latency
+    # averages. Charts that need failure data use the full records list.
+    sr = success_records  # shorthand
+
+    path = generate_latency_by_scenario(sr, output_dir)
     if path:
         generated["latency_by_scenario"] = path
         print(f"  ✓ Latency by scenario: {path}")
 
-    path = generate_throughput_chart(records, output_dir)
+    path = generate_throughput_chart(sr, output_dir)
     if path:
         generated["throughput"] = path
         print(f"  ✓ Throughput: {path}")
 
-    path = generate_throughput_over_time(records, output_dir)
+    path = generate_throughput_over_time(sr, output_dir)
     if path:
         generated["throughput_over_time"] = path
         print(f"  ✓ Throughput over time: {path}")
 
-    path = generate_bandwidth_asymmetry_chart(records, output_dir)
+    path = generate_throughput_burstiness_chart(sr, output_dir)
+    if path:
+        generated["throughput_burstiness"] = path
+        print(f"  ✓ Throughput burstiness: {path}")
+
+    path = generate_bandwidth_asymmetry_chart(sr, output_dir)
     if path:
         generated["bandwidth_asymmetry"] = path
         print(f"  ✓ Bandwidth asymmetry: {path}")
 
-    path = generate_protocol_comparison_chart(records, output_dir)
+    path = generate_protocol_comparison_chart(sr, output_dir)
     if path:
         generated["protocol_comparison"] = path
         print(f"  ✓ Protocol comparison: {path}")
 
-    path = generate_success_rate_chart(records, output_dir)
+    path = generate_success_rate_chart(records, output_dir)  # needs all records
     if path:
         generated["success_rate"] = path
         print(f"  ✓ Success rate: {path}")
 
-    path = generate_data_volume_chart(records, output_dir)
+    path = generate_data_volume_chart(records, output_dir)  # needs all records
     if path:
         generated["data_volume"] = path
         print(f"  ✓ Data volume: {path}")
 
-    path = generate_latency_heatmap(records, output_dir)
+    path = generate_latency_heatmap(sr, output_dir)
     if path:
         generated["latency_heatmap"] = path
         print(f"  ✓ Latency heatmap: {path}")
 
-    # New charts
-    path = generate_ttft_chart(records, output_dir)
+    path = generate_ttft_chart(sr, output_dir)
     if path:
         generated["ttft_by_scenario"] = path
         print(f"  ✓ TTFT by scenario: {path}")
 
-    path = generate_latency_breakdown_chart(records, output_dir)
+    path = generate_latency_breakdown_chart(sr, output_dir)
     if path:
         generated["latency_breakdown"] = path
         print(f"  ✓ Latency breakdown: {path}")
 
-    path = generate_token_throughput_chart(records, output_dir)
+    path = generate_token_throughput_chart(sr, output_dir)
     if path:
         generated["token_throughput"] = path
         print(f"  ✓ Token throughput: {path}")
 
-    path = generate_streaming_metrics_chart(records, output_dir)
+    path = generate_streaming_metrics_chart(sr, output_dir)
     if path:
         generated["streaming_metrics"] = path
         print(f"  ✓ Streaming metrics: {path}")
 
-    path = generate_tool_usage_chart(records, output_dir)
+    path = generate_tool_usage_chart(sr, output_dir)
     if path:
         generated["tool_usage"] = path
         print(f"  ✓ Tool usage: {path}")
 
-    path = generate_error_analysis_chart(records, output_dir)
+    path = generate_mcp_efficiency_chart(sr, output_dir)
+    if path:
+        generated["mcp_efficiency"] = path
+        print(f"  ✓ MCP efficiency: {path}")
+
+    path = generate_mcp_latency_breakdown_chart(sr, output_dir)
+    if path:
+        generated["mcp_latency_breakdown"] = path
+        print(f"  ✓ MCP latency breakdown: {path}")
+
+    path = generate_mcp_loop_factor_by_profile_chart(sr, output_dir)
+    if path:
+        generated["mcp_loop_factor_by_profile"] = path
+        print(f"  ✓ MCP loop factor by profile: {path}")
+
+    path = generate_tool_latency_cdf_chart(sr, output_dir)
+    if path:
+        generated["tool_latency_cdf"] = path
+        print(f"  ✓ Tool latency CDF: {path}")
+
+    path = generate_mcp_protocol_overhead_chart(sr, output_dir)
+    if path:
+        generated["mcp_protocol_overhead"] = path
+        print(f"  ✓ MCP protocol overhead: {path}")
+
+    path = generate_tool_success_rate_chart(records, output_dir)  # needs all records
+    if path:
+        generated["tool_success_rate"] = path
+        print(f"  ✓ Tool success rate: {path}")
+
+    path = generate_agent_session_waterfall_chart(sr, output_dir)
+    if path:
+        generated["agent_session_waterfall"] = path
+        print(f"  ✓ Agent session waterfall: {path}")
+
+    waterfall_paths = generate_all_agent_waterfall_charts(sr, output_dir)
+    for scenario, wpath in waterfall_paths.items():
+        generated[f"waterfall_{scenario}"] = wpath
+        print(f"  ✓ Waterfall ({scenario}): {wpath}")
+
+    path = generate_mcp_transport_comparison_chart(sr, output_dir)
+    if path:
+        generated["mcp_transport_comparison"] = path
+        print(f"  ✓ MCP transport comparison: {path}")
+
+    path = generate_token_rate_by_profile_chart(sr, output_dir)
+    if path:
+        generated["token_rate_by_profile"] = path
+        print(f"  ✓ Token rate by profile: {path}")
+
+    path = generate_context_growth_chart(sr, output_dir)
+    if path:
+        generated["context_growth"] = path
+        print(f"  ✓ Context growth: {path}")
+
+    path = generate_request_response_scatter_chart(sr, output_dir)
+    if path:
+        generated["request_response_scatter"] = path
+        print(f"  ✓ Request/response scatter: {path}")
+
+    path = generate_ttft_vs_latency_chart(sr, output_dir)
+    if path:
+        generated["ttft_vs_latency"] = path
+        print(f"  ✓ TTFT vs latency: {path}")
+
+    path = generate_inter_turn_idle_chart(sr, output_dir)
+    if path:
+        generated["inter_turn_idle"] = path
+        print(f"  ✓ Inter-turn idle time: {path}")
+
+    path = generate_degradation_heatmap_chart(sr, output_dir)
+    if path:
+        generated["degradation_heatmap"] = path
+        print(f"  ✓ Degradation heatmap: {path}")
+
+    path = generate_success_vs_latency_chart(records, output_dir)  # needs all records
+    if path:
+        generated["success_vs_latency"] = path
+        print(f"  ✓ Success vs latency: {path}")
+
+    path = generate_error_analysis_chart(records, output_dir)  # needs all records
     if path:
         generated["error_analysis"] = path
         print(f"  ✓ Error analysis: {path}")
 
-    path = generate_latency_by_profile_chart(records, output_dir)
+    path = generate_latency_by_profile_chart(sr, output_dir)
     if path:
         generated["latency_by_profile"] = path
         print(f"  ✓ Latency by profile: {path}")
 
-    path = generate_tokens_chart(records, output_dir)
+    path = generate_tokens_chart(sr, output_dir)
     if path:
         generated["token_counts"] = path
         print(f"  ✓ Token counts: {path}")
 
-    path = generate_ttft_heatmap(records, output_dir)
+    path = generate_ttft_heatmap(sr, output_dir)
     if path:
         generated["ttft_heatmap"] = path
         print(f"  ✓ TTFT heatmap: {path}")

@@ -33,6 +33,14 @@ def load_mcp_servers_config(config_path: str = None) -> dict:
         return yaml.safe_load(f)
 
 
+# Module-level shared rate state: persists across MCPToolExecutor instances
+# within the same Python process (i.e., one orchestrator invocation).
+# This ensures Spotify's global rate limit budget is tracked across experiments.
+_shared_rate_state: dict[str, deque] = {}
+_shared_rate_state_day: dict[str, deque] = {}
+_shared_rate_locks: dict[str, asyncio.Lock] = {}
+
+
 class MCPToolExecutor:
     """
     Real MCP tool executor using connected MCP servers.
@@ -40,27 +48,41 @@ class MCPToolExecutor:
     Manages MCP server lifecycle and provides tool execution.
     """
 
-    def __init__(self, server_group: str = "general"):
+    def __init__(self, server_group: str = "general", transport: str = "stdio"):
         self.mcp_client = MCPClient()
         self.server_group = server_group
+        self.transport = transport
         self.config: dict = {}
         self.connected = False
+        self.http_ports: dict[str, int] = {}  # server_name → port (HTTP mode)
         self._tool_stats: dict[str, dict] = {}
         self._rate_limits: dict[str, dict] = {}
-        self._rate_state: dict[str, deque] = {}
-        self._rate_state_day: dict[str, deque] = {}
-        self._rate_locks: dict[str, asyncio.Lock] = {}
+        self._rate_groups: dict[str, dict] = {}
+        # Use module-level shared state so rate budgets survive across experiments
+        self._rate_state = _shared_rate_state
+        self._rate_state_day = _shared_rate_state_day
+        self._rate_locks = _shared_rate_locks
         self._concurrency_limits: dict[str, asyncio.Semaphore] = {}
 
     async def connect(self, config_path: str = None):
         """Connect to MCP servers defined in configuration."""
         self.config = load_mcp_servers_config(config_path)
         self._rate_limits = self.config.get("rateLimits", {})
+        self._rate_groups = self.config.get("rateGroups", {})
+
+        # Initialize rate state for groups (shared budget across tools)
+        for group_name in self._rate_groups:
+            self._rate_state.setdefault(group_name, deque())
+            self._rate_state_day.setdefault(group_name, deque())
+            # Always create fresh locks (asyncio.Lock is event-loop bound)
+            self._rate_locks[group_name] = asyncio.Lock()
 
         for tool_name, limits in self._rate_limits.items():
-            self._rate_state.setdefault(tool_name, deque())
-            self._rate_state_day.setdefault(tool_name, deque())
-            self._rate_locks.setdefault(tool_name, asyncio.Lock())
+            # Only init per-tool state for tools without a rate_group
+            if "rate_group" not in limits:
+                self._rate_state.setdefault(tool_name, deque())
+                self._rate_state_day.setdefault(tool_name, deque())
+                self._rate_locks[tool_name] = asyncio.Lock()
             concurrent_max = limits.get("concurrent_max")
             if concurrent_max:
                 self._concurrency_limits[tool_name] = asyncio.Semaphore(concurrent_max)
@@ -86,16 +108,29 @@ class MCPToolExecutor:
                 else:
                     env[key] = value
 
+            # Only use HTTP transport for servers that support it
+            server_transport = self.transport
+            if self.transport == "http" and not server_config.get("supports_http", False):
+                server_transport = "stdio"
+
             mcp_config = MCPServerConfig(
                 name=server_name,
                 command=server_config["command"],
                 args=server_config.get("args", []),
-                env=env
+                env=env,
+                transport=server_transport,
             )
 
             success = await self.mcp_client.add_server(mcp_config)
             if success:
-                print(f"  Connected to MCP server: {server_name}")
+                conn = self.mcp_client.servers.get(server_name)
+                if self.transport == "http" and hasattr(conn, "_base_url"):
+                    # Extract port for netem loopback setup
+                    port = int(conn._base_url.rsplit(":", 1)[1])
+                    self.http_ports[server_name] = port
+                    print(f"  Connected to MCP server: {server_name} (HTTP port {port})")
+                else:
+                    print(f"  Connected to MCP server: {server_name} (stdio)")
             else:
                 print(f"  Failed to connect to MCP server: {server_name}")
 
@@ -150,18 +185,33 @@ class MCPToolExecutor:
         return self._tool_stats
 
     async def _apply_rate_limit(self, tool_name: str) -> None:
-        """Apply per-tool rate limiting based on config."""
+        """Apply rate limiting based on config.
+
+        If the tool belongs to a ``rate_group``, the group's shared sliding
+        window is used instead of a per-tool window.  This ensures that
+        tools sharing a backend budget (e.g. all Spotify endpoints) are
+        throttled correctly against a single global limit.
+        """
         limits = self._rate_limits.get(tool_name)
         if not limits:
             return
 
-        lock = self._rate_locks.setdefault(tool_name, asyncio.Lock())
+        # Resolve effective key and limits: group overrides per-tool
+        group_name = limits.get("rate_group")
+        if group_name and group_name in self._rate_groups:
+            effective_key = group_name
+            effective_limits = self._rate_groups[group_name]
+        else:
+            effective_key = tool_name
+            effective_limits = limits
+
+        lock = self._rate_locks.setdefault(effective_key, asyncio.Lock())
         async with lock:
             now = time.time()
 
-            rpm = limits.get("requests_per_minute")
+            rpm = effective_limits.get("requests_per_minute")
             if rpm:
-                window = self._rate_state.setdefault(tool_name, deque())
+                window = self._rate_state.setdefault(effective_key, deque())
                 while window and now - window[0] >= 60:
                     window.popleft()
                 if len(window) >= rpm:
@@ -173,9 +223,9 @@ class MCPToolExecutor:
                         window.popleft()
                 window.append(now)
 
-            rpd = limits.get("requests_per_day")
+            rpd = effective_limits.get("requests_per_day")
             if rpd:
-                day_window = self._rate_state_day.setdefault(tool_name, deque())
+                day_window = self._rate_state_day.setdefault(effective_key, deque())
                 while day_window and now - day_window[0] >= 86400:
                     day_window.popleft()
                 if len(day_window) >= rpd:
@@ -191,24 +241,63 @@ class MCPToolExecutor:
 class BaseAgentScenario(BaseScenario):
     """
     Base class for agent scenarios using real MCP tools.
+
+    Set ``mcp_transport: http`` in scenario config (or pass ``--mcp-transport http``
+    on the CLI) to route MCP traffic over TCP so that tc/netem on the loopback
+    interface can shape it.
     """
 
     def __init__(self, client, logger, config):
         super().__init__(client, logger, config)
         self.server_group = config.get("server_group", "general")
-        self.tool_executor = MCPToolExecutor(self.server_group)
+        self.mcp_transport = config.get("mcp_transport", "http")
+        self.tool_executor = MCPToolExecutor(
+            self.server_group, transport=self.mcp_transport
+        )
         self.max_iterations = config.get("max_tool_calls", 10)
+        self.max_tool_result_chars = config.get("max_tool_result_chars", 200000)
+        self.max_message_chars = config.get("max_message_chars", 800000)
+        self._netem_on_lo = False
+        # Set by the orchestrator before run() so setup/teardown can use it
+        self.emulator = None
+        self._current_network_profile: Optional[str] = None
 
     async def setup(self):
-        """Connect to MCP servers before running scenarios."""
-        print(f"Connecting to MCP servers (group: {self.server_group})...")
+        """Connect to MCP servers before running scenarios.
+
+        When transport is ``http`` and self.emulator is set, the same netem
+        profile is applied to the loopback interface (port-filtered) so that
+        MCP JSON-RPC traffic is shaped identically to external API traffic.
+        """
+        transport_label = self.mcp_transport
+        print(f"Connecting to MCP servers (group: {self.server_group}, transport: {transport_label})...")
         success = await self.tool_executor.connect()
         if not success:
             raise RuntimeError("Failed to connect to any MCP servers")
         print(f"Connected. Available tools: {[t.name for t in self.tool_executor.mcp_client.get_tools()]}")
 
+        # Apply netem to loopback for HTTP-mode MCP servers
+        if (
+            self.mcp_transport == "http"
+            and self.emulator is not None
+            and self._current_network_profile
+            and self.tool_executor.http_ports
+        ):
+            for name, port in self.tool_executor.http_ports.items():
+                try:
+                    self.emulator.apply_profile_to_loopback(
+                        self._current_network_profile, port
+                    )
+                    self._netem_on_lo = True
+                    print(f"  Applied netem ({self._current_network_profile}) to lo:{port} for {name}")
+                except Exception as e:
+                    print(f"  Warning: failed to apply netem to lo for {name}: {e}")
+
     async def teardown(self):
         """Disconnect MCP servers after scenarios complete."""
+        if self._netem_on_lo and self.emulator is not None:
+            self.emulator.clear_loopback()
+            self._netem_on_lo = False
         await self.tool_executor.disconnect()
 
     def run(self, network_profile: str, run_index: int = 0) -> ScenarioResult:
@@ -282,7 +371,24 @@ class BaseAgentScenario(BaseScenario):
                 turn_result["tokens_out"] += tokens_out or 0
                 turn_result["total_latency"] += response.latency_sec
 
-                # Log the API call
+                # Log the API call with full traffic detail
+                llm_meta = {
+                    "type": "llm_api_call",
+                    "iteration": iteration,
+                    "has_tools": len(response.tool_calls) > 0,
+                    "tool_names": [tc.name for tc in response.tool_calls],
+                    "message_count": len(messages),
+                    "llm_request_bytes": response.request_bytes,
+                    "llm_response_bytes": response.response_bytes,
+                }
+
+                # Capture tool call arguments the LLM is requesting
+                if response.tool_calls:
+                    llm_meta["tool_calls_detail"] = [
+                        {"name": tc.name, "arguments": tc.arguments}
+                        for tc in response.tool_calls
+                    ]
+
                 record = self._create_log_record(
                     session_id=session_id,
                     turn_index=turn_index,
@@ -300,11 +406,7 @@ class BaseAgentScenario(BaseScenario):
                     trace_request=response.request_payload,
                     trace_response=response.response_payload,
                     trace_note="agent_chat",
-                    metadata=json.dumps({
-                        "iteration": iteration,
-                        "has_tools": len(response.tool_calls) > 0,
-                        "tool_names": [tc.name for tc in response.tool_calls]
-                    })
+                    metadata=json.dumps(llm_meta)
                 )
                 self.logger.log(record)
                 turn_result["log_records"].append(record)
@@ -335,7 +437,7 @@ class BaseAgentScenario(BaseScenario):
                         content=response.content or f"Calling {tool_call.name}..."
                     ))
 
-                    # Add tool result
+                    # Add tool result (truncated to avoid context overflow)
                     if tool_result.success:
                         tool_result_str = json.dumps(tool_result.result) if isinstance(
                             tool_result.result, (dict, list)
@@ -346,12 +448,80 @@ class BaseAgentScenario(BaseScenario):
                             "success": False
                         })
 
+                    if len(tool_result_str) > self.max_tool_result_chars:
+                        tool_result_str = (
+                            tool_result_str[:self.max_tool_result_chars]
+                            + f"\n... [truncated from {len(tool_result_str)} chars]"
+                        )
+
                     messages.append(ChatMessage(
                         role=MessageRole.USER,
                         content=f"Tool result from {tool_call.name}:\n{tool_result_str}"
                     ))
 
-                    # Log tool execution
+                    # Trim older tool exchanges if context grows too large
+                    total_chars = sum(len(m.content) for m in messages)
+                    if total_chars > self.max_message_chars:
+                        # Keep system prompt (index 0), original user prompt (1),
+                        # and the most recent messages. Summarize the middle.
+                        preserved_head = 2
+                        preserved_tail = 6  # recent tool call/result pairs
+                        if len(messages) > preserved_head + preserved_tail:
+                            removed = len(messages) - preserved_head - preserved_tail
+                            messages = (
+                                messages[:preserved_head]
+                                + [ChatMessage(
+                                    role=MessageRole.USER,
+                                    content=f"[{removed} earlier tool exchanges omitted for brevity]",
+                                )]
+                                + messages[-preserved_tail:]
+                            )
+
+                    # Log tool execution with full MCP traffic detail
+                    tool_meta = {
+                        "type": "mcp_tool_call",
+                        "tool_name": tool_call.name,
+                        "iteration": iteration,
+                        "tool_arguments": tool_call.arguments,
+                        "mcp_stdio_request_bytes": tool_result.request_bytes,
+                        "mcp_stdio_response_bytes": tool_result.response_bytes,
+                    }
+
+                    # Include result summary (truncated to avoid bloating metadata)
+                    if tool_result.result:
+                        result_str = str(tool_result.result)
+                        tool_meta["result_summary"] = result_str[:500] + ("..." if len(result_str) > 500 else "")
+                        tool_meta["result_bytes"] = len(result_str)
+
+                    # Merge backend telemetry from MCP server
+                    if tool_result.backend_meta:
+                        bm = tool_result.backend_meta
+                        tool_meta["backend_total_request_bytes"] = bm.get("backend_total_request_bytes", 0)
+                        tool_meta["backend_total_response_bytes"] = bm.get("backend_total_response_bytes", 0)
+                        tool_meta["backend_total_latency_sec"] = bm.get("backend_total_latency_sec", 0)
+                        tool_meta["backend_retries"] = bm.get("backend_retries", 0)
+                        tool_meta["backend_rate_limited"] = bm.get("backend_rate_limited", False)
+                        if bm.get("backend_calls"):
+                            tool_meta["backend_calls"] = bm["backend_calls"]
+                        if bm.get("token_call"):
+                            tool_meta["token_call"] = bm["token_call"]
+
+                    # Build trace payloads for MCP tool call
+                    tool_trace_req = {
+                        "jsonrpc": "2.0",
+                        "method": "tools/call",
+                        "params": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        },
+                    }
+                    tool_trace_resp = {
+                        "success": tool_result.success,
+                        "result": tool_result.result,
+                        "error": tool_result.error,
+                        "backend_meta": tool_result.backend_meta,
+                    }
+
                     tool_record = self._create_log_record(
                         session_id=session_id,
                         turn_index=turn_index,
@@ -367,11 +537,10 @@ class BaseAgentScenario(BaseScenario):
                         tool_calls_count=1,
                         total_tool_bytes=tool_result.request_bytes + tool_result.response_bytes,
                         tool_latency_sec=tool_result.latency_sec,
-                        metadata=json.dumps({
-                            "type": "mcp_tool_call",
-                            "tool_name": tool_call.name,
-                            "iteration": iteration
-                        })
+                        trace_request=tool_trace_req,
+                        trace_response=tool_trace_resp,
+                        trace_note="mcp_tool_call",
+                        metadata=json.dumps(tool_meta)
                     )
                     self.logger.log(tool_record)
                     turn_result["log_records"].append(tool_record)

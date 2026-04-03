@@ -9,6 +9,7 @@
 
 # LLM Clients
 openai>=1.0.0
+azure-ai-inference>=1.0.0b1
 google-genai>=1.0.0
 websockets>=12.0  # For OpenAI Realtime API
 
@@ -48,6 +49,11 @@ playwright>=1.41.0
 # Install npm-based servers: npm install -g @modelcontextprotocol/server-brave-search
 # The Python MCP client uses subprocess to communicate with MCP servers.
 mcp-server-fetch>=2025.0.0
+
+# Optional: Alpaca market data MCP server
+# Install via: uvx alpaca-mcp-server init
+# Or: pip install alpaca-mcp-server
+alpaca-mcp-server>=0.1.0
 
 # Async support (included in Python 3.7+, but useful for type hints)
 # asyncio is part of stdlib

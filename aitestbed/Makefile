@@ -2,26 +2,16 @@
 # 6G AI Traffic Characterization Testbed - Makefile
 # =============================================================================
 
-.PHONY: help build run shell test clean logs report \
-        compose-up compose-down compose-logs
+.PHONY: help test clean logs report \
+        mcp mcp-full mcp-music mcp-trading mcp-playwright charts \
+        trading playwright \
+        full-test full-test-quick
 
 # Default target
 help:
 	@echo ""
 	@echo "6G AI Traffic Characterization Testbed"
 	@echo "======================================="
-	@echo ""
-	@echo "Docker Commands:"
-	@echo "  make build          Build the Docker image"
-	@echo "  make build-nocache  Build without cache"
-	@echo "  make run            Run with default settings"
-	@echo "  make shell          Start interactive shell"
-	@echo "  make test           Run a quick test scenario"
-	@echo ""
-	@echo "Docker Compose Commands:"
-	@echo "  make compose-up     Start testbed service"
-	@echo "  make compose-down   Stop services"
-	@echo "  make compose-logs   View service logs"
 	@echo ""
 	@echo "Scenario Commands:"
 	@echo "  make chat           Run chat scenario"
@@ -30,108 +20,121 @@ help:
 	@echo "  make image          Run image generation scenario"
 	@echo "  make realtime       Run real-time conversation scenario"
 	@echo "  make all            Run all scenarios"
+	@echo "  make mcp            Run all MCP scenarios (quick)"
+	@echo "  make mcp-full       Run all MCP scenarios (full)"
+	@echo "  make mcp-music      Run music MCP scenarios (quick)"
+	@echo "  make mcp-trading    Run trading MCP scenarios (quick)"
+	@echo "  make mcp-playwright Run Playwright MCP scenarios (quick)"
+	@echo "  make trading        Run single trading scenario"
+	@echo "  make playwright     Run single Playwright scenario"
+	@echo "  make full-test      Run full test suite (all scenarios, 30 runs)"
+	@echo "  make full-test-quick  Run full test suite (3 runs, quick)"
 	@echo ""
 	@echo "Utility Commands:"
 	@echo "  make logs           Show recent logs"
+	@echo "  make charts         Generate charts from latest results"
 	@echo "  make report         Generate analysis report"
-	@echo "  make clean          Remove containers and volumes"
-	@echo "  make clean-all      Remove everything including images"
+	@echo "  make clean          Remove logs and captures"
 	@echo ""
 	@echo "Setup:"
-	@echo "  1. Copy .env.example to .env"
-	@echo "  2. Add your API keys to .env"
-	@echo "  3. Run 'make build' to build the image"
+	@echo "  1. Copy .env.example to .env and add your API keys"
+	@echo "  2. pip install -r requirements.txt"
+	@echo "  3. Ensure passwordless sudo for tc (netem)"
 	@echo "  4. Run 'make test' to verify setup"
 	@echo ""
 
 # =============================================================================
-# Docker Commands
+# Quick Test
 # =============================================================================
-
-build:
-	@chmod +x docker/*.sh 2>/dev/null || true
-	docker build -t 6g-ai-testbed:latest -f Dockerfile ..
-
-build-nocache:
-	docker build --no-cache -t 6g-ai-testbed:latest -f Dockerfile ..
-
-run:
-	./docker/run.sh --help
-
-shell:
-	./docker/run.sh -i --shell
 
 test:
 	@echo "Running quick test (chat scenario, 2 runs)..."
-	./docker/run.sh python orchestrator.py --scenario chat_basic --profile ideal_6g --runs 2
-
-# =============================================================================
-# Docker Compose Commands
-# =============================================================================
-
-compose-up:
-	docker compose up -d testbed
-
-compose-down:
-	docker compose down
-
-compose-logs:
-	docker compose logs -f
+	python orchestrator.py --scenario chat_basic --profile ideal_6g --runs 2
 
 # =============================================================================
 # Scenario Commands
 # =============================================================================
 
 chat:
-	./docker/run.sh python orchestrator.py --scenario chat_basic --profile 5g_urban --runs 10
+	python orchestrator.py --scenario chat_basic --profile 5g_urban --runs 10
 
 chat-stream:
-	./docker/run.sh python orchestrator.py --scenario chat_streaming --profile 5g_urban --runs 10
+	python orchestrator.py --scenario chat_streaming --profile 5g_urban --runs 10
 
 agent:
-	./docker/run.sh python orchestrator.py --scenario shopping_agent --profile 5g_urban --runs 10
+	python orchestrator.py --scenario shopping_agent --profile 5g_urban --runs 10
 
 search:
-	./docker/run.sh python orchestrator.py --scenario web_search_agent --profile 5g_urban --runs 10
+	python orchestrator.py --scenario web_search_agent --profile 5g_urban --runs 10
 
 image:
-	./docker/run.sh python orchestrator.py --scenario image_generation --profile ideal_6g --runs 5
+	python orchestrator.py --scenario image_generation --profile ideal_6g --runs 5
 
 all:
-	./docker/run.sh python orchestrator.py --scenario all --runs 10
+	python orchestrator.py --scenario all --runs 10
 
 # Direct web search scenarios (no MCP)
 direct-search:
-	./docker/run.sh python orchestrator.py --scenario direct_web_search --profile 5g_urban --runs 10
+	python orchestrator.py --scenario direct_web_search --profile 5g_urban --runs 10
 
 direct-search-burst:
-	./docker/run.sh python orchestrator.py --scenario direct_web_search_burst --profile ideal_6g --runs 5
+	python orchestrator.py --scenario direct_web_search_burst --profile ideal_6g --runs 5
 
 search-benchmark:
-	./docker/run.sh python orchestrator.py --scenario parallel_search_benchmark --profile ideal_6g --runs 3
+	python orchestrator.py --scenario parallel_search_benchmark --profile ideal_6g --runs 3
 
 # Real-time conversational AI scenarios
 realtime:
-	./docker/run.sh python orchestrator.py --scenario realtime_text --profile 5g_urban --runs 5
+	python orchestrator.py --scenario realtime_text --profile 5g_urban --runs 5
 
 realtime-interactive:
-	./docker/run.sh python orchestrator.py --scenario realtime_interactive --profile 5g_urban --runs 5
+	python orchestrator.py --scenario realtime_interactive --profile 5g_urban --runs 5
 
 realtime-technical:
-	./docker/run.sh python orchestrator.py --scenario realtime_technical --profile 5g_urban --runs 5
+	python orchestrator.py --scenario realtime_technical --profile 5g_urban --runs 5
 
 realtime-audio:
-	./docker/run.sh python orchestrator.py --scenario realtime_audio --profile ideal_6g --runs 5
+	python orchestrator.py --scenario realtime_audio --profile ideal_6g --runs 5
 
-# Run with network emulation
+# MCP scenario runner
+mcp:
+	bash run_mcp.sh --quick
+
+mcp-full:
+	bash run_mcp.sh --full
+
+mcp-music:
+	bash run_mcp.sh --group music --quick
+
+mcp-trading:
+	bash run_mcp.sh --group trading --quick
+
+mcp-playwright:
+	bash run_mcp.sh --group playwright --quick
+
+# Individual MCP scenarios
+trading:
+	python orchestrator.py --scenario trading_market_data --profile 5g_urban --runs 5
+
+playwright:
+	python orchestrator.py --scenario playwright_web_test --profile 5g_urban --runs 5
+
+# Full test suite (all scenarios, all profiles, report generation)
+full-test:
+	bash run_full_tests.sh --full
+
+full-test-quick:
+	bash run_full_tests.sh --quick
+
+# Run with specific netem profiles
 chat-netem:
-	./docker/run.sh -n python orchestrator.py --scenario chat_basic --profile cell_edge --runs 10
+	python orchestrator.py --scenario chat_basic --profile cell_edge --runs 10
 
 agent-netem:
-	./docker/run.sh -n python orchestrator.py --scenario shopping_agent --profile satellite --runs 10
+	python orchestrator.py --scenario shopping_agent --profile satellite --runs 10
 
 direct-search-netem:
-	./docker/run.sh -n python orchestrator.py --scenario direct_web_search --profile cell_edge --runs 10
+	python orchestrator.py --scenario direct_web_search --profile cell_edge --runs 10
 
 # =============================================================================
 # Utility Commands
@@ -144,29 +147,33 @@ logs:
 	@echo "Recent reports:"
 	@ls -la reports/*.json 2>/dev/null || echo "No reports found"
 
+charts:
+	python generate_charts.py --latest
+
 report:
-	./docker/run.sh python -c "from analysis import TrafficVisualizer, MetricsCalculator; print('Analysis tools ready')"
+	python -c "from analysis import TrafficVisualizer, MetricsCalculator; print('Analysis tools ready')"
 
 clean:
-	docker compose down -v
-	docker rm -f ai-traffic-testbed 2>/dev/null || true
+	rm -f logs/test_mcp_*.log
+	@echo "Cleaned MCP log files. Database and captures preserved."
 
 clean-all: clean
-	docker rmi 6g-ai-testbed:latest 2>/dev/null || true
-	docker volume prune -f
+	rm -f logs/traffic_logs.db
+	rm -rf results/captures/*.pcap logs/traces
+	@echo "Cleaned database, pcaps, and traces."
 
 # =============================================================================
 # Development
 # =============================================================================
 
 lint:
-	./docker/run.sh python -m flake8 --max-line-length=100 .
+	python -m flake8 --max-line-length=100 .
 
 format:
-	./docker/run.sh python -m black .
+	python -m black .
 
 typecheck:
-	./docker/run.sh python -m mypy .
+	python -m mypy .
 
 # =============================================================================
 # Environment Setup
@@ -180,7 +187,10 @@ setup:
 	else \
 		echo ".env file already exists"; \
 	fi
+	pip install -r requirements.txt
 
 validate-env:
-	@./docker/run.sh python -c "import os; print('OPENAI_API_KEY:', 'set' if os.environ.get('OPENAI_API_KEY') else 'NOT SET')"
-	@./docker/run.sh python -c "import os; print('BRAVE_API_KEY:', 'set' if os.environ.get('BRAVE_API_KEY') else 'NOT SET')"
+	@python -c "import os; from dotenv import load_dotenv; load_dotenv(); print('OPENAI_API_KEY:', 'set' if os.environ.get('OPENAI_API_KEY') else 'NOT SET')"
+	@python -c "import os; from dotenv import load_dotenv; load_dotenv(); print('BRAVE_API_KEY:', 'set' if os.environ.get('BRAVE_API_KEY') else 'NOT SET')"
+	@python -c "import os; from dotenv import load_dotenv; load_dotenv(); print('SPOTIFY_CLIENT_ID:', 'set' if os.environ.get('SPOTIFY_CLIENT_ID') else 'NOT SET')"
+	@python -c "import os; from dotenv import load_dotenv; load_dotenv(); print('ALPACA_API_KEY:', 'set' if os.environ.get('ALPACA_API_KEY') else 'NOT SET')"

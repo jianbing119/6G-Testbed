@@ -36,7 +36,7 @@ class TrafficVisualizer:
     Generate visualizations for traffic analysis results.
     """
 
-    def __init__(self, output_dir: str = "reports/figures"):
+    def __init__(self, output_dir: str = "results/reports/figures"):
         """
         Initialize the visualizer.
 
@@ -284,7 +284,7 @@ class TrafficVisualizer:
     def generate_3gpp_table(
         self,
         metrics_list: list[ScenarioMetrics],
-        output_path: str = "reports/3gpp_metrics_table.md"
+        output_path: str = "results/reports/3gpp_metrics_table.md"
     ) -> Path:
         """
         Generate a markdown table formatted for 3GPP documentation.
@@ -599,7 +599,7 @@ class TrafficVisualizer:
                     generated["metrics_heatmap"] = str(path)
 
         # Generate tables
-        path = self.generate_3gpp_table(metrics_list, f"reports/{report_name}_tables.md")
+        path = self.generate_3gpp_table(metrics_list, f"results/reports/{report_name}_tables.md")
         generated["markdown_tables"] = str(path)
 
         # Generate JSON summary

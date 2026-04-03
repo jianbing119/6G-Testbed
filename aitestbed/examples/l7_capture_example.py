@@ -35,7 +35,7 @@ def example_basic_capture():
 
     # Initialize L7 capture controller
     l7_capture = L7CaptureController(
-        capture_dir="capture/l7_captures",
+        capture_dir="results/l7_captures",
         proxy_port=8080,
         web_port=8081  # Web UI at http://localhost:8081
     )
@@ -173,7 +173,7 @@ def example_analyze_capture():
     l7_capture = L7CaptureController()
 
     # Find capture files
-    capture_dir = Path("capture/l7_captures")
+    capture_dir = Path("results/l7_captures")
     if not capture_dir.exists():
         print("No capture directory found")
         return

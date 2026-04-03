@@ -170,7 +170,7 @@ class L7CaptureController:
 
     def __init__(
         self,
-        capture_dir: str = "capture/l7_captures",
+        capture_dir: str = "results/l7_captures",
         proxy_port: int = 8080,
         web_port: int = 8081
     ):

@@ -583,6 +583,10 @@ class DirectWebSearchScenario(BaseScenario):
                     if not r.success and r.error
                 ]
                 result.metadata["search_errors"] = errors[:5]  # First 5 errors
+                if not result.success:
+                    result.error_message = errors[0] if errors else "all searches failed"
+            elif not result.success:
+                result.error_message = "all searches failed"
 
             # Store detailed metrics
             result.metadata.update({

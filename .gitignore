@@ -16,9 +16,9 @@
 **/backup/
 **/backups/
 **/logs/
-**/reports/
-**/capture/captures/
-**/capture/l7_captures/
+**/results/reports/
+**/results/captures/
+**/results/l7_captures/
 **/*.log
 **/*.db
 **/*.sqlite
@@ -45,3 +45,9 @@
 
 **/results/
 **/RESULTS.md
+
+# ML artifacts (regenerable from pcaps + training scripts)
+ml/models/
+ml/data/*.npz
+ml/synthetic/
+ml/results/

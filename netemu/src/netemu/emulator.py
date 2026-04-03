@@ -23,6 +23,28 @@ from .profile import NetworkProfile
 logger = logging.getLogger(__name__)
 
 
+def _detect_default_interface() -> str:
+    """Detect the default network interface from the routing table.
+
+    Parses ``ip route show default`` to find the device used for the
+    default route.  Falls back to ``eth0`` if detection fails.
+    """
+    try:
+        result = subprocess.run(
+            ["ip", "-o", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # Example output: "default via 172.25.240.1 dev eth1 proto ..."
+        for token_idx, token in enumerate(result.stdout.split()):
+            if token == "dev" and token_idx + 1 < len(result.stdout.split()):
+                iface = result.stdout.split()[token_idx + 1]
+                logger.info(f"Auto-detected default interface: {iface}")
+                return iface
+    except Exception as e:
+        logger.warning(f"Failed to detect default interface: {e}")
+    return "eth0"
+
+
 class NetworkEmulator:
     """
     Network condition emulator using Linux tc/netem.
@@ -55,12 +77,16 @@ class NetworkEmulator:
         Initialize the network emulator.
 
         Args:
-            interface: Network interface to apply rules to.
+            interface: Network interface to apply rules to. Use "auto" to
+                detect the default interface automatically.
             profiles_path: Path to profiles YAML file. If provided, profiles
                 are loaded automatically.
             bidirectional: If True, shape both egress and ingress traffic.
             ifb_device: IFB device name for ingress shaping.
         """
+        self._interface_from_config = interface == "auto"
+        if interface == "auto":
+            interface = _detect_default_interface()
         self.interface = interface
         self.profiles: dict[str, NetworkProfile] = {}
         self.current_profile: Optional[str] = None
@@ -102,8 +128,9 @@ class NetworkEmulator:
         if not data:
             raise ProfileLoadError(path, "empty file")
 
-        if "default_interface" in data:
-            self.interface = data["default_interface"]
+        if "default_interface" in data and self._interface_from_config:
+            iface = data["default_interface"]
+            self.interface = _detect_default_interface() if iface == "auto" else iface
 
         profiles_data = data.get("profiles", {})
         if not profiles_data:
@@ -677,11 +704,26 @@ class NetworkEmulator:
                 delay_parts.append(f"{jitter_ms}ms")
                 if delay_correlation_pct is not None:
                     delay_parts.append(f"{delay_correlation_pct}%")
-                if delay_distribution:
+                if delay_distribution and delay_distribution.lower() not in ("fixed", "none"):
                     delay_parts.append(f"distribution {delay_distribution}")
             params.append(" ".join(delay_parts))
 
-        if loss_model:
+        # "none" and "correlated" are not real tc netem loss models;
+        # "correlated" just means use "loss PCT CORR%" (the default syntax).
+        # Only "gemodel" and "state" are actual advanced loss models.
+        _real_loss_models = {"gemodel", "state"}
+        _skip_loss_models = {"none", "correlated"}
+        if loss_model and loss_model.lower() in _real_loss_models:
+            if loss_pct > 0:
+                # e.g. "loss gemodel 1% 10% 70% 0.1%"
+                loss_parts = [f"loss {loss_model} {loss_pct}%"]
+                if loss_correlation_pct is not None:
+                    loss_parts.append(f"{loss_correlation_pct}%")
+                params.append(" ".join(loss_parts))
+            else:
+                params.append(f"loss {loss_model}")
+        elif loss_model and loss_model.lower() not in _skip_loss_models:
+            # Unknown model — pass through as-is for forward compat
             if loss_pct > 0:
                 loss_parts = [f"loss {loss_pct}%"]
                 if loss_correlation_pct is not None:
@@ -719,6 +761,8 @@ class NetworkEmulator:
         Clear all tc rules from the interface.
 
         Also tears down IFB device if bidirectional shaping was enabled.
+        Always attempts to remove the ingress qdisc to handle stale rules
+        left by a previous process.
 
         Returns:
             True if successful (or no rules to clear), False on error.
@@ -730,6 +774,11 @@ class NetworkEmulator:
         # Tear down IFB if it was initialized
         if self._ifb_initialized:
             self._teardown_ifb()
+        else:
+            # Always attempt to remove a potentially stale ingress qdisc
+            # left by a previous emulator instance that wasn't cleaned up.
+            cmd_del_ingress = f"sudo tc qdisc del dev {self.interface} ingress"
+            self._run_tc_command(cmd_del_ingress, ignore_errors=True)
 
         self.current_profile = None
         self.current_ingress_profile = None
@@ -756,6 +805,91 @@ class NetworkEmulator:
         except Exception as e:
             logger.error(f"tc command error: {e}")
             return False
+
+    def apply_profile_to_loopback(
+        self, profile_name: str, dest_port: int
+    ) -> bool:
+        """Apply a netem profile to the loopback interface for a specific port.
+
+        Uses ``tc prio`` + ``tc filter`` + ``iptables`` mark so that only
+        traffic to/from *dest_port* is shaped, leaving all other loopback
+        traffic unaffected.
+
+        Args:
+            profile_name: Name of the profile to apply.
+            dest_port: TCP port to filter on.
+
+        Returns:
+            True if successful.
+        """
+        if profile_name not in self.profiles:
+            raise ProfileNotFoundError(profile_name)
+
+        profile = self.profiles[profile_name]
+        netem_params = self._build_netem_params(
+            delay_ms=profile.delay_ms,
+            jitter_ms=profile.jitter_ms,
+            delay_distribution=profile.delay_distribution,
+            delay_correlation_pct=profile.delay_correlation_pct,
+            loss_pct=profile.loss_pct,
+            loss_correlation_pct=profile.loss_correlation_pct,
+            loss_model=profile.loss_model,
+            corruption_pct=profile.corruption_pct,
+            corruption_correlation_pct=profile.corruption_correlation_pct,
+            reorder_pct=profile.reorder_pct,
+            reorder_correlation_pct=profile.reorder_correlation_pct,
+            duplicate_pct=profile.duplicate_pct,
+            duplicate_correlation_pct=profile.duplicate_correlation_pct,
+            limit_packets=profile.limit_packets,
+        )
+
+        if not netem_params:
+            return True
+
+        # 1) prio qdisc on lo with 3 bands
+        if not self._run_tc_command(
+            "sudo tc qdisc add dev lo root handle 1: prio bands 3"
+        ):
+            return False
+
+        # 2) netem leaf on band 3
+        netem_str = " ".join(netem_params)
+        if not self._run_tc_command(
+            f"sudo tc qdisc add dev lo parent 1:3 handle 30: netem {netem_str}"
+        ):
+            return False
+
+        # 3) u32 filters: match TCP dport or sport → band 3 (netem)
+        #    No iptables required — works on minimal systems (e.g. WSL2).
+        #    IP protocol 6 = TCP; dport at offset 22, sport at offset 20 (from IP header start).
+        if not self._run_tc_command(
+            f"sudo tc filter add dev lo parent 1:0 protocol ip prio 1 u32 "
+            f"match ip protocol 6 0xff "
+            f"match ip dport {dest_port} 0xffff flowid 1:3"
+        ):
+            return False
+        if not self._run_tc_command(
+            f"sudo tc filter add dev lo parent 1:0 protocol ip prio 1 u32 "
+            f"match ip protocol 6 0xff "
+            f"match ip sport {dest_port} 0xffff flowid 1:3"
+        ):
+            return False
+
+        self._lo_port = dest_port
+        logger.info(
+            f"Applied {profile_name} to lo (port {dest_port}): {netem_str}"
+        )
+        return True
+
+    def clear_loopback(self) -> bool:
+        """Remove netem rules from the loopback interface."""
+        # Remove tc qdisc (and all child filters) from lo
+        self._run_tc_command(
+            "sudo tc qdisc del dev lo root", ignore_errors=True
+        )
+
+        self._lo_port = None
+        return True
 
     def get_status(self) -> dict:
         """

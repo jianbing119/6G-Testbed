@@ -60,6 +60,100 @@ mcpServers:
       - search_files
       - get_file_info
 
+  # Spotify Music - Search tracks, artists, albums, playlists; browse discography
+  # Provides: spotify_search_tracks, spotify_search_artists, spotify_search_albums,
+  #           spotify_search_playlists, spotify_artist_albums, spotify_album_tracks
+  # Install: pip install requests (included in requirements.txt)
+  # Auth: https://developer.spotify.com/dashboard → Create app → Get client ID/secret
+  spotify:
+    name: spotify
+    command: python
+    args:
+      - "-m"
+      - "mcp_servers.spotify_server"
+    env:
+      SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID}"
+      SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET}"
+    description: "Spotify music search and playlist discovery"
+    supports_http: true
+    tools:
+      - spotify_search_tracks
+      - spotify_search_artists
+      - spotify_search_albums
+      - spotify_search_playlists
+      - spotify_artist_albums
+      - spotify_album_tracks
+
+  # Playwright - Browser automation using headless Chromium
+  # Provides: playwright_navigate, playwright_screenshot, playwright_click,
+  #           playwright_fill, playwright_get_text, playwright_evaluate
+  # Install: pip install playwright && playwright install chromium
+  playwright:
+    name: playwright
+    command: python
+    args:
+      - "-m"
+      - "mcp_servers.playwright_server"
+    env: {}
+    description: "Browser automation using Playwright"
+    supports_http: true
+    tools:
+      - playwright_navigate
+      - playwright_screenshot
+      - playwright_click
+      - playwright_fill
+      - playwright_get_text
+      - playwright_evaluate
+
+  # Alpaca Market Data - Stock, crypto, and options market data
+  # Provides: get_stock_bars, get_stock_latest_quote, get_stock_latest_trade,
+  #           get_stock_snapshot, get_crypto_bars, get_crypto_latest_quote,
+  #           get_crypto_snapshot, get_option_contracts, get_option_latest_quote,
+  #           get_asset, get_all_assets, get_calendar, get_clock
+  # Install: pip install uv  (provides uvx)
+  #          uvx alpaca-mcp-server init
+  # Auth: https://app.alpaca.markets/signup → API Keys
+  # NOTE: Market data API key only — no trading/account/portfolio tools.
+  # The Alpaca server is stdio-only, so we wrap it with http_bridge
+  # to route traffic over HTTP (subject to tc/netem on loopback).
+  alpaca:
+    name: alpaca
+    command: python
+    args:
+      - "-m"
+      - "mcp_servers.http_bridge"
+      - "uvx"
+      - "alpaca-mcp-server"
+      - "serve"
+    env:
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_SECRET_KEY: "${ALPACA_SECRET_KEY}"
+    description: "Stock, crypto, and options market data via Alpaca"
+    supports_http: true
+    tools:
+      - get_stock_bars
+      - get_stock_quotes
+      - get_stock_trades
+      - get_stock_latest_bar
+      - get_stock_latest_quote
+      - get_stock_latest_trade
+      - get_stock_snapshot
+      - get_crypto_bars
+      - get_crypto_quotes
+      - get_crypto_trades
+      - get_crypto_latest_quote
+      - get_crypto_latest_bar
+      - get_crypto_latest_trade
+      - get_crypto_snapshot
+      - get_crypto_latest_orderbook
+      - get_option_contracts
+      - get_option_latest_quote
+      - get_option_snapshot
+      - get_asset
+      - get_all_assets
+      - get_calendar
+      - get_clock
+
   # Memory - Persistent key-value store
   # Provides: store, retrieve, list_keys
   memory:
@@ -88,12 +182,33 @@ serverGroups:
     - brave-search
     - fetch
 
+  # Music Agent - Spotify search and recommendations
+  music:
+    - spotify
+
+  # Music Research Agent - Spotify + web search
+  music_research:
+    - spotify
+    - brave-search
+    - fetch
+
+  # Trading / market data agent (Alpaca)
+  trading:
+    - alpaca
+
+  # Playwright browser automation agent
+  playwright:
+    - playwright
+
   # General Purpose Agent
   general:
     - brave-search
     - fetch
     - filesystem
     - memory
+    - spotify
+    - playwright
+    - alpaca
 
 # Tool Aliases for Backward Compatibility
 # Maps old mock tool names to MCP tool names
@@ -103,6 +218,15 @@ toolAliases:
   fetch_url: fetch
   check_price: brave_web_search  # Will search for product prices
 
+# Rate Groups - shared budgets across multiple tools
+# Spotify enforces a single global rate limit across all endpoints,
+# so all spotify_* tools must share one sliding window.
+rateGroups:
+  spotify_global:
+    requests_per_minute: 30
+  alpaca_global:
+    requests_per_minute: 60
+
 # Rate Limiting Configuration
 rateLimits:
   brave_web_search:
@@ -111,3 +235,39 @@ rateLimits:
   fetch:
     requests_per_minute: 30
     concurrent_max: 5
+  spotify_search_tracks:
+    rate_group: spotify_global
+  spotify_search_artists:
+    rate_group: spotify_global
+  spotify_search_albums:
+    rate_group: spotify_global
+  spotify_search_playlists:
+    rate_group: spotify_global
+  spotify_artist_albums:
+    rate_group: spotify_global
+  spotify_album_tracks:
+    rate_group: spotify_global
+  playwright_navigate:
+    requests_per_minute: 30
+    concurrent_max: 3
+  playwright_screenshot:
+    requests_per_minute: 20
+    concurrent_max: 2
+  get_stock_latest_quote:
+    rate_group: alpaca_global
+  get_stock_bars:
+    rate_group: alpaca_global
+  get_stock_snapshot:
+    rate_group: alpaca_global
+  get_stock_latest_trade:
+    rate_group: alpaca_global
+  get_crypto_latest_quote:
+    rate_group: alpaca_global
+  get_crypto_bars:
+    rate_group: alpaca_global
+  get_crypto_snapshot:
+    rate_group: alpaca_global
+  get_option_contracts:
+    rate_group: alpaca_global
+  get_option_latest_quote:
+    rate_group: alpaca_global
