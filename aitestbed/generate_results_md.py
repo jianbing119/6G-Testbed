@@ -51,20 +51,24 @@ def main() -> None:
             )
         else:
             cursor.execute("SELECT * FROM traffic_logs ORDER BY timestamp")
-        records = [dict(row) for row in cursor.fetchall()]
+        records = [
+            dict(row) for row in cursor.fetchall()
+            if not (dict(row).get("session_id") or "").startswith("pcap_")
+        ]
         conn.close()
         return records
 
     def fuse_latest_runs(records: list[dict], gap_sec: float) -> list[dict]:
         if not records:
             return []
-        by_scenario: dict[str, list[dict]] = defaultdict(list)
+        by_key: dict[str, list[dict]] = defaultdict(list)
         for record in records:
             scenario = record.get("scenario_id") or "unknown"
-            by_scenario[scenario].append(record)
+            profile = record.get("network_profile") or "unknown"
+            by_key[f"{scenario}/{profile}"].append(record)
 
         fused: list[dict] = []
-        for recs in by_scenario.values():
+        for recs in by_key.values():
             recs.sort(key=lambda r: r.get("timestamp", 0.0))
             start_idx = 0
             for i in range(len(recs) - 1, 0, -1):
@@ -155,7 +159,7 @@ def main() -> None:
         runs = len(recs)
         success = sum(1 for r in recs if r.get("success"))
         rate = round(100.0 * success / runs, 1) if runs else 0.0
-        latencies = [r.get("latency_sec", 0.0) for r in recs if r.get("latency_sec") is not None]
+        latencies = [r.get("latency_sec", 0.0) for r in recs if r.get("latency_sec") is not None and r.get("success")]
         avg_lat = round(sum(latencies) / len(latencies), 3) if latencies else 0.0
         label = scenario_label(scenario_id)
         lines.append(f"| {label} | {runs} | {rate} | {avg_lat} |")
@@ -179,7 +183,7 @@ def main() -> None:
         runs = len(recs)
         success = sum(1 for r in recs if r.get("success"))
         success_rate = f"{round(100.0 * success / runs, 0)}%" if runs else "0%"
-        latencies = [r.get("latency_sec", 0.0) for r in recs if r.get("latency_sec") is not None]
+        latencies = [r.get("latency_sec", 0.0) for r in recs if r.get("latency_sec") is not None and r.get("success")]
         avg_lat = round(sum(latencies) / len(latencies), 3) if latencies else 0.0
         min_lat = round(min(latencies), 3) if latencies else 0.0
         max_lat = round(max(latencies), 3) if latencies else 0.0
@@ -220,6 +224,57 @@ def main() -> None:
             ratio = "0:1"
         label = scenario_label(scenario_id)
         lines.append(f"| {label} | {avg_req} | {avg_resp} | {ratio} |")
+
+    # ── Local Inference section ────────────────────────────────────────────
+    LOCAL_INFERENCE_SCENARIOS = {"chat_vllm", "video_understanding_vllm"}
+    local_scenarios = [s for s in scenario_ids if s in LOCAL_INFERENCE_SCENARIOS]
+    if local_scenarios:
+        lines.append("")
+        lines.append("## Local Inference Scenarios")
+        lines.append("")
+        lines.append("> **Note on measurement methodology:** The scenarios below run against a "
+                     "locally-hosted LLM inference server. Unlike cloud LLM scenarios "
+                     "where the measured latency conflates network round-trip time with unknown "
+                     "server-side inference time, these local scenarios allow us to **directly "
+                     "measure model inference time** because the server runs on the same machine. "
+                     "The network impairment applied via tc/netem on the loopback interface "
+                     "isolates the transport-layer effect from the compute-layer effect, enabling "
+                     "a clean decomposition of end-to-end latency into:")
+        lines.append(">")
+        lines.append("> - **Network component:** Added by tc/netem (delay, loss, rate limiting)")
+        lines.append("> - **Inference component:** Actual GPU compute time for the model")
+        lines.append(">")
+        lines.append("> For the video understanding scenario, the request payload includes the "
+                     "video file base64-encoded inline (~1.3 MB per request), making it "
+                     "upload-heavy and sensitive to bandwidth constraints.")
+        lines.append("")
+        lines.append("| Scenario | Profile | Runs | Avg Latency (s) | Avg TTFT (s) | Avg Request (KB) | Avg Response (KB) | UL/DL Ratio |")
+        lines.append("|----------|---------|------|-----------------|--------------|------------------|-------------------|-------------|")
+
+        for scenario_id in local_scenarios:
+            for profile_name, _ in NETWORK_PROFILES:
+                key = (scenario_id, profile_name)
+                recs = by_scenario_profile.get(key, [])
+                if not recs:
+                    continue
+                runs = len(recs)
+                latencies = [r.get("latency_sec", 0.0) for r in recs if r.get("latency_sec") is not None and r.get("success")]
+                avg_lat = round(sum(latencies) / len(latencies), 1) if latencies else 0.0
+                ttfts = ttft_by_scenario_profile.get(key, [])
+                avg_ttft = round(sum(ttfts) / len(ttfts), 3) if ttfts else None
+                ttft_str = f"{avg_ttft}" if avg_ttft is not None else "—"
+                reqs = [r.get("request_bytes", 0) or 0 for r in recs]
+                resps = [r.get("response_bytes", 0) or 0 for r in recs]
+                avg_req_kb = round(sum(reqs) / len(reqs) / 1024, 1) if reqs else 0
+                avg_resp_kb = round(sum(resps) / len(resps) / 1024, 1) if resps else 0
+                ratio = f"{round(sum(reqs) / max(sum(resps), 1), 0):.0f}:1" if sum(resps) > 0 else "—"
+                # For video, UL > DL so show UL:DL; for chat, DL > UL
+                if sum(reqs) > sum(resps):
+                    ratio = f"{round(sum(reqs) / max(sum(resps), 1), 0):.0f}:1 (UL)"
+                else:
+                    ratio = f"{round(sum(resps) / max(sum(reqs), 1), 0):.0f}:1 (DL)"
+                label = scenario_label(scenario_id)
+                lines.append(f"| {label} | {profile_name} | {runs} | {avg_lat} | {ttft_str} | {avg_req_kb} | {avg_resp_kb} | {ratio} |")
 
     lines.append("")
     lines.append("## SDP Offer/Answer Samples (WebRTC)")
@@ -327,48 +382,70 @@ def main() -> None:
     lines.append("")
     lines.append("## Charts")
     lines.append("")
-    lines.append("### Latency Distribution")
-    lines.append("![Latency by Scenario](reports/figures/latency_by_scenario.png)")
-    lines.append("")
-    lines.append("### Time to First Token (TTFT)")
-    lines.append("![TTFT by Scenario](reports/figures/ttft_by_scenario.png)")
-    lines.append("")
-    lines.append("### Latency Breakdown (TTFT vs Generation)")
-    lines.append("![Latency Breakdown](reports/figures/latency_breakdown.png)")
-    lines.append("")
-    lines.append("### Bandwidth Asymmetry")
-    lines.append("![Bandwidth Asymmetry](reports/figures/bandwidth_asymmetry.png)")
-    lines.append("")
-    lines.append("### Throughput")
-    lines.append("![Throughput](reports/figures/throughput_by_scenario.png)")
-    lines.append("")
-    lines.append("### Token Counts")
-    lines.append("![Token Counts](reports/figures/token_counts.png)")
-    lines.append("")
-    lines.append("### Success Rate")
-    lines.append("![Success Rate](reports/figures/success_rate.png)")
-    lines.append("")
-    lines.append("### Latency by Network Profile")
-    lines.append("![Latency by Profile](reports/figures/latency_by_profile.png)")
-    lines.append("")
-    lines.append("### Latency Heatmap (Scenario × Profile)")
-    lines.append("![Latency Heatmap](reports/figures/latency_heatmap.png)")
-    lines.append("")
-    lines.append("### TTFT Heatmap (Scenario × Profile)")
-    lines.append("![TTFT Heatmap](reports/figures/ttft_heatmap.png)")
-    lines.append("")
-    lines.append("### Streaming Metrics")
-    lines.append("![Streaming Metrics](reports/figures/streaming_metrics.png)")
-    lines.append("")
-    lines.append("### Protocol Comparison")
-    lines.append("![Protocol Comparison](reports/figures/protocol_comparison.png)")
-    lines.append("")
-    lines.append("### Data Volume")
-    lines.append("![Data Volume](reports/figures/data_volume.png)")
+
+    # Ordered list of charts with section titles. Charts not found on disk are skipped.
+    chart_entries = [
+        ("Latency Distribution", "latency_by_scenario.png"),
+        ("Time to First Token (TTFT)", "ttft_by_scenario.png"),
+        ("Latency Breakdown (TTFT vs Generation)", "latency_breakdown.png"),
+        ("Bandwidth Asymmetry (UL/DL)", "bandwidth_asymmetry.png"),
+        ("Throughput", "throughput_by_scenario.png"),
+        ("Throughput Over Time", "throughput_over_time.png"),
+        ("Traffic Burstiness (Per-Request Throughput)", "throughput_burstiness.png"),
+        ("Token Counts", "token_counts.png"),
+        ("Token Throughput", "token_throughput.png"),
+        ("Token Rate by Profile", "token_rate_by_profile.png"),
+        ("Success Rate", "success_rate.png"),
+        ("Success vs Latency", "success_vs_latency.png"),
+        ("Error Analysis", "error_analysis.png"),
+        ("Latency by Network Profile", "latency_by_profile.png"),
+        ("Latency Heatmap (Scenario × Profile)", "latency_heatmap.png"),
+        ("TTFT Heatmap (Scenario × Profile)", "ttft_heatmap.png"),
+        ("TTFT vs Latency", "ttft_vs_latency.png"),
+        ("Degradation Heatmap", "degradation_heatmap.png"),
+        ("Streaming Metrics", "streaming_metrics.png"),
+        ("Protocol Comparison", "protocol_comparison.png"),
+        ("Data Volume", "data_volume.png"),
+        ("Request/Response Scatter", "request_response_scatter.png"),
+        ("Context Growth", "context_growth.png"),
+        ("Inter-Turn Idle Time", "inter_turn_idle.png"),
+        ("Tool Usage", "tool_usage.png"),
+        ("Tool Success Rate", "tool_success_rate.png"),
+        ("Tool Latency CDF", "tool_latency_cdf.png"),
+        ("MCP Efficiency", "mcp_efficiency.png"),
+        ("MCP Latency Breakdown", "mcp_latency_breakdown.png"),
+        ("MCP Loop Factor by Profile", "mcp_loop_factor_by_profile.png"),
+        ("MCP Protocol Overhead", "mcp_protocol_overhead.png"),
+        ("Agent Session Waterfall", "agent_session_waterfall.png"),
+        ("Pcap RTT Analysis", "pcap_rtt_analysis.png"),
+        ("Pcap Throughput", "pcap_throughput.png"),
+        ("Pcap Retransmissions", "pcap_retransmissions.png"),
+    ]
+
+    from pathlib import Path as _Path
+    figures_dir = _Path("results/reports/figures")
+    for title, filename in chart_entries:
+        if (figures_dir / filename).exists():
+            lines.append(f"### {title}")
+            lines.append(f"![{title}](results/reports/figures/{filename})")
+            lines.append("")
+
+    # Include any per-scenario waterfall charts
+    waterfalls_dir = figures_dir / "waterfalls"
+    if waterfalls_dir.exists():
+        waterfall_files = sorted(waterfalls_dir.glob("waterfall_*.png"))
+        if waterfall_files:
+            lines.append("### Agent Session Waterfalls (Per-Scenario)")
+            lines.append("")
+            for wf in waterfall_files:
+                scenario_name = wf.stem.replace("waterfall_", "").replace("_", " ").title()
+                lines.append(f"**{scenario_name}**")
+                lines.append(f"![Waterfall {scenario_name}](results/reports/figures/waterfalls/{wf.name})")
+                lines.append("")
     lines.append("")
     lines.append("## Data Export")
     lines.append("")
-    lines.append("All chart data is available in Excel format: `reports/chart_data.xlsx`")
+    lines.append("All chart data is available in Excel format: `results/reports/chart_data.xlsx`")
     lines.append("")
     lines.append("Sheets included:")
     lines.append("- Latency_by_Scenario")

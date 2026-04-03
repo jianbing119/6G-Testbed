@@ -85,6 +85,14 @@ class NetworkProfile:
             >>> profile.delay_ms
             100
         """
+        # Normalize loss_model: treat "none" (string) same as absent/null
+        loss_model = data.get("loss_model")
+        if isinstance(loss_model, str) and loss_model.lower() == "none":
+            loss_model = None
+
+        # Accept both "limit_packets" and legacy "limit_pkts"
+        limit_packets = data.get("limit_packets") or data.get("limit_pkts")
+
         return cls(
             name=name,
             description=data.get("description", ""),
@@ -94,7 +102,7 @@ class NetworkProfile:
             delay_correlation_pct=data.get("delay_correlation_pct"),
             loss_pct=data.get("loss_pct", 0.0),
             loss_correlation_pct=data.get("loss_correlation_pct"),
-            loss_model=data.get("loss_model"),
+            loss_model=loss_model,
             rate_mbit=data.get("rate_mbit"),
             rate_ceil_mbit=data.get("rate_ceil_mbit"),
             rate_burst_kbit=data.get("rate_burst_kbit"),
@@ -105,5 +113,5 @@ class NetworkProfile:
             reorder_correlation_pct=data.get("reorder_correlation_pct"),
             duplicate_pct=data.get("duplicate_pct", 0.0),
             duplicate_correlation_pct=data.get("duplicate_correlation_pct"),
-            limit_packets=data.get("limit_packets"),
+            limit_packets=limit_packets,
         )

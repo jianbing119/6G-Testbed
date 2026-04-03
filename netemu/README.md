@@ -194,18 +194,49 @@ emulator = NetworkEmulator(interface="eth0", bidirectional=False)
 
 ## Sudoers Setup
 
-To run without password prompts, add to `/etc/sudoers` (use `visudo`):
+netemu requires root privileges for `tc`, `ip`, and `modprobe` commands. To run without password prompts, create a sudoers drop-in file:
+
+```bash
+sudo visudo -f /etc/sudoers.d/netemu
+```
+
+Add the following line (adjust the binary paths to match your system):
 
 ```
-# Allow user to run tc and ip commands without password
-username ALL=(ALL) NOPASSWD: /sbin/tc, /sbin/ip, /sbin/modprobe ifb*
+username ALL=(ALL) NOPASSWD: /usr/sbin/tc, /usr/sbin/ip, /usr/sbin/modprobe
 ```
 
 Or for a group:
 
 ```
-%netemu ALL=(ALL) NOPASSWD: /sbin/tc, /sbin/ip, /sbin/modprobe ifb*
+%netemu ALL=(ALL) NOPASSWD: /usr/sbin/tc, /usr/sbin/ip, /usr/sbin/modprobe
 ```
+
+Binary paths vary by distribution. Find the correct paths with:
+
+```bash
+which tc ip modprobe
+```
+
+Common locations:
+- Debian/Ubuntu/WSL2: `/usr/sbin/tc`, `/usr/sbin/ip`, `/usr/sbin/modprobe`
+- Older distros: `/sbin/tc`, `/sbin/ip`, `/sbin/modprobe`
+
+If using packet capture (e.g. with the AI testbed), also add `tcpdump`:
+
+```
+username ALL=(ALL) NOPASSWD: /usr/sbin/tc, /usr/sbin/ip, /usr/sbin/modprobe, /usr/bin/tcpdump
+```
+
+Verify passwordless access:
+
+```bash
+sudo -n tc qdisc show dev eth0
+sudo -n ip link show
+sudo -n modprobe -n ifb
+```
+
+All three should complete without prompting for a password.
 
 ## Troubleshooting
 

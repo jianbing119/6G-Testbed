@@ -52,11 +52,11 @@ docs/_build/
 # Logs and data (will be mounted as volumes)
 logs/*.db
 logs/*.log
-reports/*.json
-reports/*.md
-reports/figures/*.png
-capture/captures/*.pcap
-capture/l7_captures/*.jsonl
+results/reports/*.json
+results/reports/*.md
+results/reports/figures/*.png
+results/captures/*.pcap
+results/l7_captures/*.jsonl
 
 # Environment files (contain secrets)
 .env

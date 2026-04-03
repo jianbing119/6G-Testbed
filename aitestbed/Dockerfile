@@ -49,6 +49,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     # Build tools (for some Python packages)
     build-essential \
+    pkg-config \
+    # FFmpeg dev libs (required by PyAV for WebRTC/realtime scenarios)
+    libavformat-dev \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavutil-dev \
+    libavfilter-dev \
+    libswscale-dev \
+    libswresample-dev \
     # Node.js runtime (for MCP servers)
     nodejs \
     npm \
@@ -73,9 +82,11 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Create non-root user for security (but allow sudo for network emulation)
+# The emulator uses: tc, ip, modprobe (for IFB), tcpdump, iptables
+# Paths vary across distros so we grant by command name via ALL
 RUN useradd -m -s /bin/bash testbed \
     && apt-get update && apt-get install -y sudo \
-    && echo "testbed ALL=(ALL) NOPASSWD: /sbin/tc, /usr/sbin/tcpdump, /sbin/iptables" >> /etc/sudoers \
+    && echo "testbed ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -91,7 +102,7 @@ RUN pip install --no-cache-dir /tmp/netemu && rm -rf /tmp/netemu
 COPY aitestbed/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir playwright \
-    && playwright install-deps chromium || true
+    && playwright install chromium --with-deps || true
 
 # Copy application code
 COPY aitestbed/ .
@@ -99,14 +110,14 @@ COPY aitestbed/ .
 # Create necessary directories
 RUN mkdir -p \
     logs \
-    reports/figures \
-    capture/captures \
-    capture/l7_captures \
+    results/reports/figures \
+    results/captures \
+    results/l7_captures \
     /tmp/testbed-sandbox \
     && chown -R testbed:testbed /app /tmp/testbed-sandbox
 
 # Set up entrypoint script (already copied as part of aitestbed/)
-RUN cp docker/entrypoint.sh /entrypoint.sh && chmod +x /entrypoint.sh
+RUN install -m 0755 docker/entrypoint.sh /entrypoint.sh
 
 # Switch to non-root user
 USER testbed

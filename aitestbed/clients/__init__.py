@@ -10,6 +10,8 @@ from .openai_client import OpenAIClient
 from .gemini_client import GeminiClient
 from .deepseek_client import DeepSeekClient
 from .vllm_client import VLLMClient
+from .azure_openai_client import AzureOpenAIClient
+from .azure_inference_client import AzureInferenceClient
 from .mcp_client import (
     MCPClient,
     MCPServerConfig,
@@ -44,6 +46,8 @@ __all__ = [
     "GeminiClient",
     "DeepSeekClient",
     "VLLMClient",
+    "AzureOpenAIClient",
+    "AzureInferenceClient",
     "MCPClient",
     "MCPServerConfig",
     "MCPServerConnection",

@@ -369,7 +369,7 @@ computer_action_records = [r for r in records
 
 ## Report Output Format
 
-The `MetricsCalculator.to_3gpp_format()` method converts metrics to 3GPP-aligned JSON format with millisecond precision.
+The `MetricsCalculator.to_3gpp_format()` method converts metrics to JSON format with millisecond precision.
 
 ### Output Structure
 

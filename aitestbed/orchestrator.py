@@ -10,6 +10,8 @@ import logging
 import time
 import yaml
 import json
+import signal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -18,9 +20,10 @@ from dataclasses import asdict
 # Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()  # Loads from .env in current directory
-load_dotenv(Path(__file__).parent / ".env")  # Also try testbed/.env
+load_dotenv(Path(__file__).parent / ".env")  # Also try aitestbed/.env
+load_dotenv(Path(__file__).parent.parent / ".env")  # Also try repo root .env
 
-from clients import OpenAIClient, GeminiClient, DeepSeekClient, VLLMClient
+from clients import OpenAIClient, GeminiClient, DeepSeekClient, VLLMClient, AzureOpenAIClient, AzureInferenceClient
 from analysis import TrafficLogger, MetricsCalculator, LogRecord
 from netemu import NetworkEmulator
 from scenarios import (
@@ -39,6 +42,10 @@ from scenarios import (
     RealtimeAudioScenario,
     RealtimeAudioWebRTCScenario,
     ComputerUseScenario,
+    MusicAgentScenario,
+    MusicResearchAgentScenario,
+    PlaywrightAgentScenario,
+    TradingAgentScenario,
 )
 
 # Configure logging
@@ -47,6 +54,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("orchestrator")
+
+
+class RunFailedError(Exception):
+    """Raised when a run fails and --stop-on-error is active."""
+    pass
 
 
 class TestbedOrchestrator:
@@ -59,8 +71,9 @@ class TestbedOrchestrator:
         config_path: str = "configs/scenarios.yaml",
         profiles_path: str = "configs/profiles.yaml",
         db_path: str = "logs/traffic_logs.db",
-        network_interface: str = "eth0",
-        egress_only: bool = False
+        network_interface: str = "auto",
+        egress_only: bool = False,
+        mcp_transport: str = "http",
     ):
         """
         Initialize the orchestrator.
@@ -86,6 +99,9 @@ class TestbedOrchestrator:
             profiles_path=str(self.profiles_path),
             bidirectional=not egress_only
         )
+        # Expose the resolved interface (in case "auto" was passed)
+        self.network_interface = self.emulator.interface
+        self.mcp_transport = mcp_transport
 
         # Initialize clients (lazy loaded based on provider)
         self._clients = {}
@@ -103,6 +119,13 @@ class TestbedOrchestrator:
             "video_understanding": VideoUnderstandingScenario,
             "video": VideoUnderstandingScenario,
             "computer_use": ComputerUseScenario,
+            # Music agent scenarios (Spotify MCP)
+            "music_agent": MusicAgentScenario,
+            "music_research_agent": MusicResearchAgentScenario,
+            # Playwright browser automation agent
+            "playwright_agent": PlaywrightAgentScenario,
+            # Trading / market data agent (Alpaca MCP)
+            "trading_agent": TradingAgentScenario,
             # Direct search scenarios (no MCP)
             "direct_search": DirectWebSearchScenario,
             "direct_web_search": DirectWebSearchScenario,
@@ -125,9 +148,41 @@ class TestbedOrchestrator:
                 self._clients[provider] = DeepSeekClient()
             elif provider == "vllm":
                 self._clients[provider] = VLLMClient()
+            elif provider == "azure_openai":
+                self._clients[provider] = AzureOpenAIClient()
+            elif provider == "azure_inference":
+                self._clients[provider] = AzureInferenceClient()
             else:
                 raise ValueError(f"Unknown provider: {provider}")
         return self._clients[provider]
+
+    def get_completed_runs(self, scenario_name: str, profile_name: str) -> int:
+        """Query the DB for the number of completed successful runs.
+
+        A "completed run" is a distinct session_id where every record has
+        success=1 for the given scenario+profile combination.
+        """
+        import sqlite3
+        try:
+            db_path = self.logger.db_path
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.execute("""
+                    SELECT COUNT(DISTINCT session_id) FROM traffic_logs
+                    WHERE scenario_id = ?
+                      AND network_profile = ?
+                      AND session_id NOT LIKE 'timeout_%'
+                      AND session_id NOT LIKE 'pcap_%'
+                      AND session_id NOT IN (
+                          SELECT DISTINCT session_id FROM traffic_logs
+                          WHERE scenario_id = ?
+                            AND network_profile = ?
+                            AND success = 0
+                      )
+                """, (scenario_name, profile_name, scenario_name, profile_name))
+                count = cursor.fetchone()[0]
+                return count
+        except Exception:
+            return 0
 
     def run_experiment(
         self,
@@ -135,7 +190,10 @@ class TestbedOrchestrator:
         profile_name: str,
         runs: int = 10,
         inter_run_delay: float = 1.0,
-        ingress_profile: Optional[str] = None
+        ingress_profile: Optional[str] = None,
+        run_timeout: Optional[float] = None,
+        stop_on_error: bool = False,
+        resume: bool = False,
     ) -> list[ScenarioResult]:
         """
         Run a single experiment (scenario + profile combination).
@@ -147,14 +205,26 @@ class TestbedOrchestrator:
             inter_run_delay: Delay between runs in seconds
             ingress_profile: Optional separate profile for ingress traffic.
                             None = use same as egress, "none" = no ingress shaping
+            run_timeout: Per-run timeout in seconds. None means no timeout.
+            stop_on_error: If True, raise RunFailedError on the first failed run
+                          (after retries are exhausted).
+            resume: If True, query the DB for already-completed successful runs
+                   and skip them.
 
         Returns:
             List of ScenarioResult objects
+
+        Raises:
+            RunFailedError: If stop_on_error is True and a run fails.
         """
         # Get scenario configuration
         scenario_config = self.scenarios_config["scenarios"].get(scenario_name)
         if not scenario_config:
             raise ValueError(f"Unknown scenario: {scenario_name}")
+
+        if scenario_config.get("disabled", False):
+            logger.info(f"Skipping disabled scenario: {scenario_name}")
+            return []
 
         # Determine scenario type and class
         scenario_type = scenario_config.get("type", "chat")
@@ -168,7 +238,15 @@ class TestbedOrchestrator:
 
         # Create scenario instance
         scenario_config["scenario_id"] = scenario_name
+        # Inject MCP transport setting for agent scenarios
+        if self.mcp_transport != "stdio" and "mcp_transport" not in scenario_config:
+            scenario_config["mcp_transport"] = self.mcp_transport
         scenario = scenario_class(client, self.logger, scenario_config)
+
+        # Pass emulator to agent scenarios so they can apply netem to loopback
+        if hasattr(scenario, "emulator"):
+            scenario.emulator = self.emulator
+            scenario._current_network_profile = profile_name
 
         # Apply network profile
         if ingress_profile:
@@ -184,15 +262,41 @@ class TestbedOrchestrator:
         retry_backoff_sec = float(defaults.get("retry_backoff_sec", 1.0))
         retry_backoff_multiplier = float(defaults.get("retry_backoff_multiplier", 2.0))
 
+        # Resume: skip already-completed runs
+        start_run = 0
+        if resume:
+            completed = self.get_completed_runs(scenario_name, profile_name)
+            if completed >= runs:
+                logger.info(
+                    f"Skipping {scenario_name}/{profile_name}: "
+                    f"all {runs} runs already completed ({completed} in DB)"
+                )
+                self.emulator.clear()
+                return results
+            if completed > 0:
+                start_run = completed
+                logger.info(
+                    f"Resuming {scenario_name}/{profile_name} from run "
+                    f"{start_run + 1}/{runs} ({completed} already completed)"
+                )
+
         try:
-            for run_index in range(runs):
+            for run_index in range(start_run, runs):
                 logger.info(f"Running {scenario_name} [{run_index + 1}/{runs}] with profile {profile_name}")
 
                 attempt = 0
                 retry_reason = None
                 while True:
                     t_start = time.time()
-                    result = scenario.run(network_profile=profile_name, run_index=run_index)
+
+                    if run_timeout is not None:
+                        result = self._run_with_timeout(
+                            scenario, profile_name, run_index, run_timeout,
+                            scenario_name,
+                        )
+                    else:
+                        result = scenario.run(network_profile=profile_name, run_index=run_index)
+
                     t_elapsed = time.time() - t_start
 
                     current_reason = self._get_retry_reason(result)
@@ -232,7 +336,66 @@ class TestbedOrchestrator:
             # Clear network profile
             self.emulator.clear()
 
+        # stop-on-error: only raise if every run failed on a baseline profile
+        # (no_emulation), indicating a real infrastructure problem. Failures on
+        # degraded profiles (satellite, congested, cell_edge, etc.) are expected
+        # data points — the network conditions *are* the cause.
+        baseline_profiles = {"no_emulation", "ideal_6g"}
+        if (
+            stop_on_error
+            and results
+            and not any(r.success for r in results)
+            and profile_name in baseline_profiles
+        ):
+            raise RunFailedError(
+                f"{scenario_name}/{profile_name}: all {len(results)} runs failed. "
+                f"Last error: {results[-1].error_message}"
+            )
+
         return results
+
+    def _run_with_timeout(
+        self,
+        scenario,
+        profile_name: str,
+        run_index: int,
+        timeout_sec: float,
+        scenario_name: str,
+    ) -> ScenarioResult:
+        """Run a single scenario with a per-run timeout.
+
+        Uses a thread pool so the main thread can enforce the deadline.
+        If the run exceeds *timeout_sec*, a failed ScenarioResult is returned
+        with the timeout noted in the error message.
+        """
+        def _run_in_thread():
+            """Wrapper that ensures an event loop exists for async scenarios."""
+            import asyncio
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            return scenario.run(network_profile=profile_name, run_index=run_index)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_in_thread)
+            try:
+                return future.result(timeout=timeout_sec)
+            except FuturesTimeoutError:
+                logger.warning(
+                    f"  Run {run_index + 1} of {scenario_name} timed out "
+                    f"after {timeout_sec:.0f}s"
+                )
+                # Build a failed result so the run is recorded
+                return ScenarioResult(
+                    scenario_id=scenario_name,
+                    session_id=f"timeout_{int(time.time())}",
+                    network_profile=profile_name,
+                    run_index=run_index,
+                    success=False,
+                    total_latency_sec=timeout_sec,
+                    error_message=f"Run timed out after {timeout_sec:.0f}s",
+                )
 
     def _get_retry_reason(self, result: ScenarioResult) -> Optional[str]:
         """Return a retry reason for transient failures."""
@@ -274,7 +437,10 @@ class TestbedOrchestrator:
     def run_test_matrix(
         self,
         matrix: Optional[list[dict]] = None,
-        runs_per_experiment: int = 10
+        runs_per_experiment: int = 10,
+        run_timeout: Optional[float] = None,
+        stop_on_error: bool = False,
+        resume: bool = False,
     ) -> dict:
         """
         Run a full test matrix.
@@ -282,6 +448,9 @@ class TestbedOrchestrator:
         Args:
             matrix: Test matrix definition (uses config if not provided)
             runs_per_experiment: Default runs per experiment
+            run_timeout: Per-run timeout in seconds (None = no timeout)
+            stop_on_error: If True, abort the entire matrix on the first failed run.
+            resume: If True, skip scenario/profile combos already completed in the DB.
 
         Returns:
             Dictionary with all results and computed metrics
@@ -297,6 +466,10 @@ class TestbedOrchestrator:
 
         for entry in matrix:
             scenario_name = entry["scenario"]
+            scenario_def = self.scenarios_config["scenarios"].get(scenario_name, {})
+            if scenario_def.get("disabled", False):
+                logger.info(f"Skipping disabled scenario: {scenario_name}")
+                continue
             profiles = entry.get("profiles", ["ideal_6g"])
             runs = entry.get("runs", runs_per_experiment)
 
@@ -310,7 +483,10 @@ class TestbedOrchestrator:
                     results = self.run_experiment(
                         scenario_name=scenario_name,
                         profile_name=profile_name,
-                        runs=runs
+                        runs=runs,
+                        run_timeout=run_timeout,
+                        stop_on_error=stop_on_error,
+                        resume=resume,
                     )
 
                     all_results[experiment_key] = results
@@ -353,6 +529,8 @@ class TestbedOrchestrator:
                     logger.info(f"Metrics: latency_mean={metrics.latency_mean:.3f}s, "
                                f"success_rate={metrics.success_rate:.1f}%")
 
+                except RunFailedError:
+                    raise
                 except Exception as e:
                     logger.error(f"Experiment failed: {e}")
                     all_results[experiment_key] = {"error": str(e)}
@@ -375,7 +553,7 @@ class TestbedOrchestrator:
     def generate_report(
         self,
         metrics: list,
-        output_path: str = "reports/experiment_report.json"
+        output_path: str = "results/reports/experiment_report.json"
     ) -> None:
         """Generate a JSON report from metrics."""
         output_path = Path(output_path)
@@ -436,8 +614,8 @@ def main():
     )
     parser.add_argument(
         "--interface",
-        default="eth0",
-        help="Network interface for emulation"
+        default="auto",
+        help="Network interface for emulation (auto = detect from default route)"
     )
     parser.add_argument(
         "--egress-only",
@@ -451,7 +629,7 @@ def main():
     )
     parser.add_argument(
         "--report",
-        default="reports/experiment_report.json",
+        default="results/reports/experiment_report.json",
         help="Output path for report"
     )
     parser.add_argument(
@@ -476,7 +654,7 @@ def main():
     )
     parser.add_argument(
         "--capture-dir",
-        default="capture/captures",
+        default="results/captures",
         help="Directory for pcap captures"
     )
     parser.add_argument(
@@ -486,7 +664,7 @@ def main():
     )
     parser.add_argument(
         "--capture-l7-dir",
-        default="capture/l7_captures",
+        default="results/l7_captures",
         help="Directory for L7 captures"
     )
     parser.add_argument(
@@ -506,6 +684,30 @@ def main():
         default=8081,
         help="Port for mitmproxy web UI (0 to disable)"
     )
+    parser.add_argument(
+        "--mcp-transport",
+        choices=["stdio", "http"],
+        default="http",
+        help="MCP server transport: stdio (pipe, no netem) or http (TCP, netem-shaped)"
+    )
+    parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=None,
+        help="Per-run timeout in seconds (default: no timeout). "
+             "Individual runs that exceed this are marked as failed and skipped."
+    )
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop immediately on the first failed run (after retries)."
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from where a previous run left off. Skips scenario/profile "
+             "combinations that already have enough successful runs in the database."
+    )
 
     args = parser.parse_args()
 
@@ -514,13 +716,15 @@ def main():
         profiles_path=args.profiles,
         db_path=args.db,
         network_interface=args.interface,
-        egress_only=args.egress_only
+        egress_only=args.egress_only,
+        mcp_transport=args.mcp_transport,
     )
 
     if args.list_scenarios:
         print("\nAvailable scenarios:")
         for name, config in orchestrator.scenarios_config["scenarios"].items():
-            print(f"  - {name}: {config.get('description', 'No description')}")
+            disabled = " [DISABLED]" if config.get("disabled", False) else ""
+            print(f"  - {name}: {config.get('description', 'No description')}{disabled}")
         return
 
     if args.list_profiles:
@@ -539,7 +743,7 @@ def main():
             try:
                 from capture import CaptureController
                 pcap_controller = CaptureController(
-                    interface=args.interface,
+                    interface=orchestrator.network_interface,
                     capture_dir=args.capture_dir
                 )
                 pcap_start_time = time.time()
@@ -573,7 +777,12 @@ def main():
 
         if args.scenario == "all":
             # Run full test matrix
-            results = orchestrator.run_test_matrix(runs_per_experiment=args.runs)
+            results = orchestrator.run_test_matrix(
+                runs_per_experiment=args.runs,
+                run_timeout=args.run_timeout,
+                stop_on_error=args.stop_on_error,
+                resume=args.resume,
+            )
             orchestrator.generate_report(results["metrics"], args.report)
         elif args.scenario:
             # Run single scenario
@@ -581,7 +790,10 @@ def main():
                 scenario_name=args.scenario,
                 profile_name=args.profile,
                 runs=args.runs,
-                ingress_profile=args.ingress_profile
+                ingress_profile=args.ingress_profile,
+                run_timeout=args.run_timeout,
+                stop_on_error=args.stop_on_error,
+                resume=args.resume,
             )
 
             # Compute and display metrics

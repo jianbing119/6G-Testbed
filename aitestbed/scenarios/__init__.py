@@ -26,6 +26,9 @@ from .direct_search import (
     ThreadedSearchExecutor,
     ThreadedSearchResult,
 )
+from .music_agent import MusicAgentScenario, MusicResearchAgentScenario
+from .playwright_agent import PlaywrightAgentScenario
+from .trading_agent import TradingAgentScenario
 from .realtime import (
     RealtimeConversationScenario,
     RealtimeWebRTCConversationScenario,
@@ -46,6 +49,13 @@ __all__ = [
     "MultimodalScenario",
     "VideoUnderstandingScenario",
     "ComputerUseScenario",
+    # Music agent (Spotify MCP)
+    "MusicAgentScenario",
+    "MusicResearchAgentScenario",
+    # Playwright browser automation agent
+    "PlaywrightAgentScenario",
+    # Trading / market data agent (Alpaca MCP)
+    "TradingAgentScenario",
     # Direct search (no MCP)
     "DirectSearchClient",
     "DirectWebSearchScenario",

@@ -33,9 +33,9 @@ services:
 
     volumes:
       - ./logs:/app/logs
-      - ./reports:/app/reports
-      - ./capture/captures:/app/capture/captures
-      - ./capture/l7_captures:/app/capture/l7_captures
+      - ./results/reports:/app/results/reports
+      - ./results/captures:/app/results/captures
+      - ./results/l7_captures:/app/results/l7_captures
       - testbed-sandbox:/tmp/testbed-sandbox
 
     ports:

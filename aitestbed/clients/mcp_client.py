@@ -34,6 +34,7 @@ class MCPToolResult:
     latency_sec: float = 0.0
     request_bytes: int = 0
     response_bytes: int = 0
+    backend_meta: Optional[dict] = None
 
 
 @dataclass
@@ -44,6 +45,9 @@ class MCPServerConfig:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     cwd: Optional[str] = None
+    transport: str = "stdio"  # "stdio" or "http"
+    http_host: str = "127.0.0.1"
+    http_port: int = 0  # 0 = auto-assign
 
 
 class MCPServerConnection:
@@ -134,20 +138,37 @@ class MCPServerConnection:
 
             return response.get("result", {}), len(request_bytes), len(response_line)
 
+    def _send_notification(self, method: str, params: dict = None) -> int:
+        """Send a JSON-RPC notification (no id, no response expected)."""
+        if not self.process or self.process.poll() is not None:
+            return 0
+        notification = {"jsonrpc": "2.0", "method": method}
+        if params:
+            notification["params"] = params
+        data = json.dumps(notification) + "\n"
+        encoded = data.encode()
+        self.process.stdin.write(encoded)
+        self.process.stdin.flush()
+        return len(encoded)
+
     async def _initialize(self):
         """Send initialize request to MCP server."""
+        try:
+            from mcp.types import LATEST_PROTOCOL_VERSION
+            protocol_version = LATEST_PROTOCOL_VERSION
+        except ImportError:
+            protocol_version = "2025-11-25"
+
         params = {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {}
-            },
+            "protocolVersion": protocol_version,
+            "capabilities": {},
             "clientInfo": {
                 "name": "6g-ai-traffic-testbed",
                 "version": "1.0.0"
             }
         }
         await self._send_request("initialize", params)
-        await self._send_request("notifications/initialized")
+        self._send_notification("notifications/initialized")
 
     async def _list_tools(self):
         """Discover available tools from the server."""
@@ -178,6 +199,9 @@ class MCPServerConnection:
 
             latency = time.time() - t_start
 
+            # Extract backend telemetry (non-standard _meta field)
+            backend_meta = result.pop("_meta", None)
+
             # Extract content from result
             content = result.get("content", [])
             if content and isinstance(content, list):
@@ -187,13 +211,20 @@ class MCPServerConnection:
             else:
                 result_data = result
 
+            is_error = result.get("isError", False)
+            error_msg = None
+            if is_error:
+                error_msg = result_data if isinstance(result_data, str) else str(result_data)
+
             return MCPToolResult(
                 tool_name=tool_name,
-                success=not result.get("isError", False),
+                success=not is_error,
                 result=result_data,
+                error=error_msg,
                 latency_sec=latency,
                 request_bytes=req_bytes,
-                response_bytes=resp_bytes
+                response_bytes=resp_bytes,
+                backend_meta=backend_meta,
             )
 
         except Exception as e:
@@ -203,6 +234,182 @@ class MCPServerConnection:
                 result=None,
                 error=str(e),
                 latency_sec=time.time() - t_start
+            )
+
+
+class MCPHttpConnection:
+    """
+    Manages connection to an MCP server over HTTP.
+
+    Launches the MCP server subprocess with ``--http`` and communicates
+    via HTTP POST so that traffic traverses the network stack and is
+    affected by tc/netem rules on the loopback interface.
+    """
+
+    def __init__(self, config: MCPServerConfig):
+        self.config = config
+        self.process: Optional[subprocess.Popen] = None
+        self.tools: dict[str, MCPTool] = {}
+        self._request_id = 0
+        self._base_url: str = ""
+
+    async def connect(self) -> bool:
+        try:
+            import requests as _requests
+            self._requests = _requests
+
+            env = os.environ.copy()
+            env.update(self.config.env)
+
+            # Launch the server with --http flag
+            args = [self.config.command] + self.config.args + ["--http"]
+            if self.config.http_port:
+                args.append(f"--port={self.config.http_port}")
+            if self.config.http_host != "127.0.0.1":
+                args.append(f"--host={self.config.http_host}")
+
+            self.process = subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                cwd=self.config.cwd,
+            )
+
+            # Read the PORT=<n> line the server prints on startup
+            port_line = self.process.stdout.readline().decode().strip()
+            if not port_line.startswith("PORT="):
+                raise RuntimeError(
+                    f"MCP HTTP server did not report port: {port_line}"
+                )
+            port = int(port_line.split("=", 1)[1])
+            self._base_url = f"http://{self.config.http_host}:{port}"
+
+            # Initialize and list tools
+            await self._initialize()
+            await self._list_tools()
+            return True
+
+        except Exception as e:
+            print(f"Failed to connect to MCP HTTP server {self.config.name}: {e}")
+            return False
+
+    async def disconnect(self):
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            self.process = None
+
+    def _send_http(self, method: str, params: dict = None) -> tuple[dict, int, int]:
+        """Send a JSON-RPC request over HTTP and return (result, req_bytes, resp_bytes)."""
+        self._request_id += 1
+        request = {
+            "jsonrpc": "2.0",
+            "id": self._request_id,
+            "method": method,
+        }
+        if params:
+            request["params"] = params
+
+        request_body = json.dumps(request).encode()
+        resp = self._requests.post(
+            self._base_url,
+            data=request_body,
+            headers={"Content-Type": "application/json"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        response = resp.json()
+
+        if "error" in response:
+            raise RuntimeError(f"MCP error: {response['error']}")
+
+        return response.get("result", {}), len(request_body), len(resp.content)
+
+    def _send_http_notification(self, method: str, params: dict = None) -> int:
+        """Send a JSON-RPC notification over HTTP (no id, no response expected)."""
+        notification = {"jsonrpc": "2.0", "method": method}
+        if params:
+            notification["params"] = params
+        body = json.dumps(notification).encode()
+        self._requests.post(
+            self._base_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        return len(body)
+
+    async def _initialize(self):
+        try:
+            from mcp.types import LATEST_PROTOCOL_VERSION
+            protocol_version = LATEST_PROTOCOL_VERSION
+        except ImportError:
+            protocol_version = "2025-11-25"
+
+        params = {
+            "protocolVersion": protocol_version,
+            "capabilities": {},
+            "clientInfo": {"name": "6g-ai-traffic-testbed", "version": "1.0.0"},
+        }
+        self._send_http("initialize", params)
+        self._send_http_notification("notifications/initialized")
+
+    async def _list_tools(self):
+        result, _, _ = self._send_http("tools/list")
+        self.tools = {}
+        for tool_data in result.get("tools", []):
+            tool = MCPTool(
+                name=tool_data["name"],
+                description=tool_data.get("description", ""),
+                input_schema=tool_data.get("inputSchema", {}),
+                server_name=self.config.name,
+            )
+            self.tools[tool.name] = tool
+
+    async def call_tool(self, tool_name: str, arguments: dict) -> MCPToolResult:
+        t_start = time.time()
+        try:
+            result, req_bytes, resp_bytes = self._send_http(
+                "tools/call", {"name": tool_name, "arguments": arguments}
+            )
+            latency = time.time() - t_start
+
+            backend_meta = result.pop("_meta", None)
+
+            content = result.get("content", [])
+            if content and isinstance(content, list):
+                text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                result_data = "\n".join(text_parts) if text_parts else content
+            else:
+                result_data = result
+
+            is_error = result.get("isError", False)
+            error_msg = None
+            if is_error:
+                error_msg = result_data if isinstance(result_data, str) else str(result_data)
+
+            return MCPToolResult(
+                tool_name=tool_name,
+                success=not is_error,
+                result=result_data,
+                error=error_msg,
+                latency_sec=latency,
+                request_bytes=req_bytes,
+                response_bytes=resp_bytes,
+                backend_meta=backend_meta,
+            )
+        except Exception as e:
+            return MCPToolResult(
+                tool_name=tool_name,
+                success=False,
+                result=None,
+                error=str(e),
+                latency_sec=time.time() - t_start,
             )
 
 
@@ -220,7 +427,10 @@ class MCPClient:
 
     async def add_server(self, config: MCPServerConfig) -> bool:
         """Add and connect to an MCP server."""
-        connection = MCPServerConnection(config)
+        if config.transport == "http":
+            connection = MCPHttpConnection(config)
+        else:
+            connection = MCPServerConnection(config)
         if await connection.connect():
             self.servers[config.name] = connection
             # Register tools from this server

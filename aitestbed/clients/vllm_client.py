@@ -229,13 +229,29 @@ class VLLMClient(LLMClient):
     ) -> ChatResponse:
         """
         Generate content from a video + text prompt using OpenAI-compatible
-        message content with video_url.
+        message content.
+
+        If *video_url* is a ``file://`` path, the file is base64-encoded and
+        sent inline as a ``data:`` URI so the video bytes actually traverse
+        the network (and are subject to tc/netem shaping).  Remote URLs are
+        passed through as-is.
         """
+        import base64
+        from pathlib import Path
+
+        actual_url = video_url
+        if video_url.startswith("file://"):
+            local_path = Path(video_url.removeprefix("file://"))
+            if local_path.exists():
+                raw = local_path.read_bytes()
+                b64 = base64.b64encode(raw).decode("ascii")
+                actual_url = f"data:video/mp4;base64,{b64}"
+
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "video_url", "video_url": {"url": video_url}},
+                    {"type": "video_url", "video_url": {"url": actual_url}},
                     {"type": "text", "text": prompt},
                 ],
             }

@@ -7,7 +7,10 @@
   "providers": {
     "openai": "Provider A",
     "gemini": "Provider B",
-    "deepseek": "Provider C"
+    "deepseek": "Provider C",
+    "azure_openai": "Provider D",
+    "azure_inference": "Provider E",
+    "vllm": "Provider F"
   },
   "models": {
     "gpt-5-mini": "Model A1",
@@ -19,7 +22,11 @@
     "gemini-3-flash-preview": "Model B1",
     "deepseek-chat": "Model C1",
     "deepseek-coder": "Model C2",
-    "deepseek-reasoner": "Model C3"
+    "deepseek-reasoner": "Model C3",
+    "gpt-image-1-mini": "Model D1",
+    "Phi-4-mini-instruct": "Model E1",
+    "Llama-4-Maverick-17B-128E-Instruct-FP8": "Model E2",
+    "Qwen/Qwen3-VL-30B-A3B-Instruct": "Model F1"
   },
   "scenarios": {
     "chat_basic": "Chat Basic",
@@ -48,6 +55,23 @@
     "shopping_agent": "Shopping Agent",
     "shopping_agent_deepseek": "Shopping Agent",
     "web_search_agent": "Web Search Agent",
-    "web_search_agent_deepseek": "Web Search Agent"
+    "web_search_agent_deepseek": "Web Search Agent",
+    "chat_azure_openai": "Chat Basic",
+    "chat_azure_openai_streaming": "Chat Streaming",
+    "shopping_agent_azure_openai": "Shopping Agent",
+    "image_generation_azure": "Image Generation",
+    "chat_azure_inference": "Chat Basic",
+    "chat_azure_inference_streaming": "Chat Streaming",
+    "chat_azure_inference_llama": "Chat Streaming",
+    "music_search": "MCP Music Search",
+    "music_search_deepseek": "MCP Music Search",
+    "music_playlist": "MCP Music Playlist",
+    "music_research": "MCP Music Research",
+    "trading_market_data": "MCP Market Data",
+    "trading_options_scan": "MCP Options Scan",
+    "playwright_web_test": "MCP Browser Test",
+    "playwright_web_test_text": "MCP Browser Test (Text)",
+    "chat_vllm": "Chat (Local Inference)",
+    "video_understanding_vllm": "Video Understanding (Local Inference)"
   }
 }

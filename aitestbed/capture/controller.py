@@ -24,7 +24,7 @@ class CaptureController:
     def __init__(
         self,
         interface: str = "eth0",
-        capture_dir: str = "capture/captures"
+        capture_dir: str = "results/captures"
     ):
         """
         Initialize the capture controller.

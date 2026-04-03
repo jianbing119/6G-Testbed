@@ -39,6 +39,25 @@ class TTSAudioResult:
     response_format: str = "pcm"
 
 
+def _estimate_realtime_tokens(
+    client: LLMClient,
+    model: str,
+    turn_metrics: RealtimeTurnMetrics,
+) -> tuple[Optional[int], Optional[int]]:
+    """Estimate tokens for realtime turns using available text/transcripts."""
+    input_text = turn_metrics.input_text or turn_metrics.input_transcript or ""
+    output_text = turn_metrics.output_text or turn_metrics.output_transcript or ""
+
+    tokens_in = None
+    tokens_out = None
+    if input_text:
+        tokens_in = client.estimate_tokens(input_text, model)
+    if output_text:
+        tokens_out = client.estimate_tokens(output_text, model)
+
+    return tokens_in, tokens_out
+
+
 class RealtimeConversationScenario(BaseScenario):
     """
     Real-time conversational AI scenario for measuring WebSocket-based
@@ -186,6 +205,8 @@ class RealtimeConversationScenario(BaseScenario):
                 result.total_latency_sec += turn_metrics.total_latency or 0.0
                 result.total_request_bytes += turn_metrics.request_bytes
                 result.total_response_bytes += turn_metrics.response_bytes
+                result.total_tokens_in += record.tokens_in or 0
+                result.total_tokens_out += record.tokens_out or 0
 
                 # Track TTFT from first turn
                 if result.ttft_sec is None and turn_metrics.ttft is not None:
@@ -253,7 +274,11 @@ class RealtimeConversationScenario(BaseScenario):
         """Create a log record from turn metrics."""
         # Build inter-chunk times JSON
         inter_chunk_json = json.dumps(turn_metrics.inter_chunk_times)
-        tokens_in, tokens_out = self._estimate_realtime_tokens(turn_metrics)
+        tokens_in, tokens_out = _estimate_realtime_tokens(
+            self.client,
+            self.config.get("model", "gpt-realtime-mini"),
+            turn_metrics,
+        )
 
         # Build metadata for realtime-specific info
         metadata = {
@@ -814,7 +839,11 @@ class RealtimeAudioScenario(BaseScenario):
     ) -> LogRecord:
         """Create log record for audio turn."""
         inter_chunk_json = json.dumps(turn_metrics.inter_chunk_times)
-        tokens_in, tokens_out = self._estimate_realtime_tokens(turn_metrics)
+        tokens_in, tokens_out = _estimate_realtime_tokens(
+            self.client,
+            self.config.get("model", "gpt-realtime-mini"),
+            turn_metrics,
+        )
 
         metadata = {
             "input_transcript": turn_metrics.input_transcript,
@@ -881,30 +910,19 @@ class RealtimeAudioScenario(BaseScenario):
         result.total_latency_sec += turn_metrics.total_latency or 0.0
         result.total_request_bytes += turn_metrics.request_bytes
         result.total_response_bytes += turn_metrics.response_bytes
+        tokens_in, tokens_out = _estimate_realtime_tokens(
+            self.client,
+            self.config.get("model", "gpt-realtime-mini"),
+            turn_metrics,
+        )
+        result.total_tokens_in += tokens_in or 0
+        result.total_tokens_out += tokens_out or 0
 
         if result.ttft_sec is None and turn_metrics.ttft is not None:
             result.ttft_sec = turn_metrics.ttft
 
         if turn_metrics.ttlt is not None:
             result.ttlt_sec = turn_metrics.ttlt
-
-    def _estimate_realtime_tokens(
-        self,
-        turn_metrics: RealtimeTurnMetrics
-    ) -> tuple[Optional[int], Optional[int]]:
-        """Estimate tokens for realtime turns using available text/transcripts."""
-        model = self.config.get("model", "gpt-realtime-mini")
-        input_text = turn_metrics.input_text or turn_metrics.input_transcript or ""
-        output_text = turn_metrics.output_text or turn_metrics.output_transcript or ""
-
-        tokens_in = None
-        tokens_out = None
-        if input_text:
-            tokens_in = self.client.estimate_tokens(input_text, model)
-        if output_text:
-            tokens_out = self.client.estimate_tokens(output_text, model)
-
-        return tokens_in, tokens_out
 
 
 class RealtimeAudioWebRTCScenario(RealtimeAudioScenario):

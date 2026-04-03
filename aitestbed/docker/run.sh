@@ -21,7 +21,7 @@ NC='\033[0m'
 IMAGE="6g-ai-testbed:latest"
 NETWORK_EMULATION=""
 INTERACTIVE=""
-VOLUMES="-v $(pwd)/logs:/app/logs -v $(pwd)/reports:/app/reports -v $(pwd)/capture/captures:/app/capture/captures -v $(pwd)/capture/l7_captures:/app/capture/l7_captures"
+VOLUMES="-v $(pwd)/logs:/app/logs -v $(pwd)/results/reports:/app/results/reports -v $(pwd)/results/captures:/app/results/captures -v $(pwd)/results/l7_captures:/app/results/l7_captures"
 ENV_FILE=""
 EXTRA_ARGS=""
 
@@ -73,7 +73,7 @@ show_help() {
     echo ""
     echo "Environment:"
     echo "  API keys are loaded from .env file (copy from .env.example)"
-    echo "  Results are saved to ./logs and ./reports directories"
+    echo "  Results are saved to ./logs and ./results/reports directories"
     echo ""
 }
 
