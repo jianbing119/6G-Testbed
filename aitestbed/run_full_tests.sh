@@ -106,6 +106,34 @@ HAS_ALPACA=false
 HAS_VLLM=false
 RUN_STRESS_TESTS=false
 
+# vLLM lifecycle. When MANAGE_VLLM=true (default), this script starts vllm
+# before the vllm phase and stops it on exit (including INT/TERM/error).
+# Set MANAGE_VLLM=false to skip auto-management — useful when an operator
+# already runs a long-lived vllm server independently and the script should
+# only probe reachability. The managed server stays loaded across the whole
+# run; if one is already up at ${VLLM_HOST}:${VLLM_PORT}, it is reused.
+#
+# VLLM_BACKEND selects how the server is launched:
+#   docker (default)  — runs vllm/vllm-openai container; needs docker + nvidia-container-toolkit
+#   host              — spawns `vllm serve` directly; needs `vllm` on PATH and working CUDA
+MANAGE_VLLM=${MANAGE_VLLM:-true}
+VLLM_BACKEND=${VLLM_BACKEND:-docker}
+VLLM_MODEL=${VLLM_MODEL:-Qwen/Qwen3-VL-30B-A3B-Instruct}
+VLLM_HOST=${VLLM_HOST:-127.0.0.1}
+VLLM_PORT=${VLLM_PORT:-8000}
+VLLM_GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.95}
+VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-131072}
+VLLM_EXTRA_ARGS=${VLLM_EXTRA_ARGS:---trust-remote-code --tensor-parallel-size 1}
+VLLM_LOG=${VLLM_LOG:-logs/vllm_server.log}
+VLLM_PID_FILE=${VLLM_PID_FILE:-logs/vllm_server.pid}
+VLLM_STARTUP_TIMEOUT_SEC=${VLLM_STARTUP_TIMEOUT_SEC:-600}
+VLLM_SHUTDOWN_TIMEOUT_SEC=${VLLM_SHUTDOWN_TIMEOUT_SEC:-30}
+VLLM_STARTED_BY_US=false
+# Docker backend knobs
+VLLM_IMAGE=${VLLM_IMAGE:-vllm/vllm-openai:latest}
+VLLM_CONTAINER_NAME=${VLLM_CONTAINER_NAME:-vllm-testbed}
+VLLM_HF_CACHE=${VLLM_HF_CACHE:-$HOME/.cache/huggingface}
+
 ALL_PROFILES=()
 TEST_MATRIX_ENTRIES=()
 FAILED_SCENARIOS=()
@@ -178,11 +206,20 @@ check_optional_prereqs() {
     fi
 
     # Check vLLM server
-    if curl -sf http://localhost:8000/v1/models > /dev/null 2>&1; then
+    if vllm_reachable; then
         HAS_VLLM=true
-        log_info "  + vLLM server reachable at localhost:8000"
+        log_info "  + vLLM server reachable at ${VLLM_HOST}:${VLLM_PORT}"
     else
-        log_warn "  - vLLM server not reachable (start with: docker run ... vllm/vllm-openai)"
+        log_warn "  - vLLM server not reachable at ${VLLM_HOST}:${VLLM_PORT}"
+        if [[ "$MANAGE_VLLM" == "true" ]]; then
+            # Auto-management is on but the server didn't come up — most
+            # likely the vllm phase is disabled, so start_vllm_server was
+            # skipped. vllm scenarios will be skipped by the prereq check.
+            log_warn "    (MANAGE_VLLM=true but the vllm phase is disabled, so no server was started)"
+        else
+            log_warn "    Start it manually (vllm serve ${VLLM_MODEL} --host ${VLLM_HOST} --port ${VLLM_PORT} ...)"
+            log_warn "    or unset MANAGE_VLLM=false to let this script auto-start it"
+        fi
     fi
 
     log_warn "  - Azure scenarios disabled in this runner"
@@ -406,7 +443,249 @@ cleanup_network_state() {
 }
 
 cleanup_on_exit() {
+    # vLLM teardown first — kill the server before tearing down lo qdiscs
+    # so its workers see a clean loopback during shutdown.
+    stop_vllm_server || true
     cleanup_network_state "${LAST_INTERFACE:-}"
+}
+
+# ---------------------------------------------------------------------------
+# vLLM server lifecycle
+# ---------------------------------------------------------------------------
+#
+# vllm scenarios target http://${VLLM_HOST}:${VLLM_PORT} on the loopback
+# interface. The orchestrator applies tc/netem to lo *per scenario* via the
+# scenarios.yaml `network_interface: lo` setting, so the server itself sees
+# unshaped lo at startup/shutdown — netem only kicks in while a scenario
+# runs. We therefore clear lo before launching vllm to make sure no stale
+# qdisc from a prior crashed run interferes with model load.
+
+vllm_reachable() {
+    curl -sf "http://${VLLM_HOST}:${VLLM_PORT}/v1/models" > /dev/null 2>&1
+}
+
+start_vllm_server() {
+    # No-op when not in managed mode.
+    if [[ "$MANAGE_VLLM" != "true" ]]; then
+        return 0
+    fi
+
+    # If something is already serving on the port, reuse it. The operator may
+    # have started it themselves and forgotten to unset MANAGE_VLLM.
+    if vllm_reachable; then
+        log_info "vLLM already reachable at ${VLLM_HOST}:${VLLM_PORT} — reusing existing server"
+        HAS_VLLM=true
+        return 0
+    fi
+
+    case "$VLLM_BACKEND" in
+        docker) _start_vllm_docker ;;
+        host)   _start_vllm_host   ;;
+        *)
+            log_error "Unknown VLLM_BACKEND=${VLLM_BACKEND} (expected: docker|host)"
+            return 1
+            ;;
+    esac
+}
+
+_start_vllm_host() {
+    if ! command -v vllm > /dev/null 2>&1; then
+        log_error "VLLM_BACKEND=host but 'vllm' is not on PATH (pip install vllm)"
+        return 1
+    fi
+
+    # Make sure lo is unshaped before vllm initializes its sockets.
+    sudo tc qdisc del dev lo root    >/dev/null 2>&1 || true
+    sudo tc qdisc del dev lo ingress >/dev/null 2>&1 || true
+
+    mkdir -p "$(dirname "$VLLM_LOG")"
+    : > "$VLLM_LOG"
+
+    log_info "Starting vLLM (host): model=${VLLM_MODEL} host=${VLLM_HOST} port=${VLLM_PORT}"
+    log_info "  log: $VLLM_LOG  (timeout ${VLLM_STARTUP_TIMEOUT_SEC}s for model load)"
+
+    # setsid puts vllm in its own process group so we can SIGTERM the whole
+    # tree (vllm spawns worker procs) on shutdown.
+    setsid vllm serve "$VLLM_MODEL" \
+        --host "$VLLM_HOST" \
+        --port "$VLLM_PORT" \
+        --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
+        --max-model-len "$VLLM_MAX_MODEL_LEN" \
+        $VLLM_EXTRA_ARGS \
+        > "$VLLM_LOG" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$VLLM_PID_FILE"
+    VLLM_STARTED_BY_US=true
+
+    local waited=0
+    while (( waited < VLLM_STARTUP_TIMEOUT_SEC )); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_error "vLLM exited during startup (pid $pid). Tail of $VLLM_LOG:"
+            tail -n 40 "$VLLM_LOG" | sed 's/^/    /' >&2 || true
+            rm -f "$VLLM_PID_FILE"
+            VLLM_STARTED_BY_US=false
+            return 1
+        fi
+        if vllm_reachable; then
+            log_info "vLLM ready at ${VLLM_HOST}:${VLLM_PORT} (pid $pid, ${waited}s)"
+            HAS_VLLM=true
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        if (( waited % 30 == 0 )); then
+            log_info "  still waiting for vLLM (${waited}s / ${VLLM_STARTUP_TIMEOUT_SEC}s)..."
+        fi
+    done
+
+    log_error "vLLM did not become ready within ${VLLM_STARTUP_TIMEOUT_SEC}s. Tail of $VLLM_LOG:"
+    tail -n 40 "$VLLM_LOG" | sed 's/^/    /' >&2 || true
+    stop_vllm_server || true
+    return 1
+}
+
+_start_vllm_docker() {
+    # Preflight
+    if ! command -v docker > /dev/null 2>&1; then
+        log_error "VLLM_BACKEND=docker but 'docker' is not on PATH"
+        return 1
+    fi
+    if ! docker info > /dev/null 2>&1; then
+        log_error "Cannot access the Docker daemon (is it running? are you in the 'docker' group?)"
+        log_error "  Fix: sudo usermod -aG docker \$USER && newgrp docker"
+        return 1
+    fi
+
+    # Adopt or clean up any existing container with the same name.
+    local existing_status
+    existing_status=$(docker inspect -f '{{.State.Status}}' "$VLLM_CONTAINER_NAME" 2>/dev/null || echo "")
+    if [[ "$existing_status" == "running" ]]; then
+        log_info "Adopting already-running container '${VLLM_CONTAINER_NAME}'"
+        VLLM_STARTED_BY_US=true
+    elif [[ -n "$existing_status" ]]; then
+        log_info "Removing stale container '${VLLM_CONTAINER_NAME}' (status=${existing_status})"
+        docker rm -f "$VLLM_CONTAINER_NAME" > /dev/null 2>&1 || true
+        existing_status=""
+    fi
+
+    if [[ "$existing_status" != "running" ]]; then
+        # Unshape lo before container-side socket setup.
+        sudo tc qdisc del dev lo root    >/dev/null 2>&1 || true
+        sudo tc qdisc del dev lo ingress >/dev/null 2>&1 || true
+
+        mkdir -p "$(dirname "$VLLM_LOG")"
+        : > "$VLLM_LOG"
+
+        log_info "Starting vLLM (docker): image=${VLLM_IMAGE} name=${VLLM_CONTAINER_NAME}"
+        log_info "  model=${VLLM_MODEL}  bind=${VLLM_HOST}:${VLLM_PORT}  HF cache=${VLLM_HF_CACHE}"
+        log_info "  log: $VLLM_LOG  (timeout ${VLLM_STARTUP_TIMEOUT_SEC}s for model load)"
+
+        local cid err
+        if ! err=$(docker run -d --name "$VLLM_CONTAINER_NAME" \
+                --gpus all --ipc=host \
+                -v "${VLLM_HF_CACHE}:/root/.cache/huggingface" \
+                -p "${VLLM_HOST}:${VLLM_PORT}:8000" \
+                "$VLLM_IMAGE" \
+                --model "$VLLM_MODEL" \
+                --max-model-len "$VLLM_MAX_MODEL_LEN" \
+                --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
+                $VLLM_EXTRA_ARGS 2>&1); then
+            log_error "docker run failed:"
+            printf '    %s\n' "$err" >&2
+            return 1
+        fi
+        cid="$err"
+        log_info "Container started (id=${cid:0:12})"
+        VLLM_STARTED_BY_US=true
+    fi
+
+    # Wait for /v1/models to respond. Also fail fast if the container dies.
+    local waited=0
+    while (( waited < VLLM_STARTUP_TIMEOUT_SEC )); do
+        if ! docker inspect -f '{{.State.Running}}' "$VLLM_CONTAINER_NAME" 2>/dev/null | grep -q '^true$'; then
+            log_error "vLLM container stopped during startup. Tail of docker logs:"
+            docker logs --tail 40 "$VLLM_CONTAINER_NAME" 2>&1 | sed 's/^/    /' >&2 || true
+            docker logs --tail 200 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
+            return 1
+        fi
+        if vllm_reachable; then
+            log_info "vLLM ready at ${VLLM_HOST}:${VLLM_PORT} (container ${VLLM_CONTAINER_NAME}, ${waited}s)"
+            # Snapshot startup logs so the operator can tail $VLLM_LOG later
+            # (live tail: `docker logs -f ${VLLM_CONTAINER_NAME}`)
+            docker logs --tail 100 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
+            HAS_VLLM=true
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        if (( waited % 30 == 0 )); then
+            log_info "  still waiting for vLLM container (${waited}s / ${VLLM_STARTUP_TIMEOUT_SEC}s)..."
+        fi
+    done
+
+    log_error "vLLM container did not become ready within ${VLLM_STARTUP_TIMEOUT_SEC}s. Tail of docker logs:"
+    docker logs --tail 40 "$VLLM_CONTAINER_NAME" 2>&1 | sed 's/^/    /' >&2 || true
+    docker logs --tail 200 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
+    stop_vllm_server || true
+    return 1
+}
+
+stop_vllm_server() {
+    if [[ "$VLLM_STARTED_BY_US" != "true" ]]; then
+        return 0
+    fi
+    case "$VLLM_BACKEND" in
+        docker) _stop_vllm_docker ;;
+        host)   _stop_vllm_host   ;;
+    esac
+    VLLM_STARTED_BY_US=false
+}
+
+_stop_vllm_docker() {
+    if ! docker inspect "$VLLM_CONTAINER_NAME" > /dev/null 2>&1; then
+        return 0
+    fi
+    log_info "Stopping vLLM container '${VLLM_CONTAINER_NAME}' (timeout ${VLLM_SHUTDOWN_TIMEOUT_SEC}s)..."
+    # Save final logs before removal — useful for post-mortem.
+    docker logs --tail 200 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
+    if docker stop --time "$VLLM_SHUTDOWN_TIMEOUT_SEC" "$VLLM_CONTAINER_NAME" > /dev/null 2>&1; then
+        log_info "vLLM container stopped cleanly"
+    else
+        log_warn "docker stop didn't complete cleanly — sending SIGKILL"
+        docker kill "$VLLM_CONTAINER_NAME" > /dev/null 2>&1 || true
+    fi
+    docker rm "$VLLM_CONTAINER_NAME" > /dev/null 2>&1 || true
+}
+
+_stop_vllm_host() {
+    if [[ ! -f "$VLLM_PID_FILE" ]]; then
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$VLLM_PID_FILE" 2>/dev/null || true)
+    rm -f "$VLLM_PID_FILE"
+
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    log_info "Stopping vLLM (pid $pid, group $pid)..."
+    # SIGTERM the whole process group so vllm workers exit too.
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+
+    local waited=0
+    while (( waited < VLLM_SHUTDOWN_TIMEOUT_SEC )); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_info "vLLM stopped cleanly after ${waited}s"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    log_warn "vLLM did not exit within ${VLLM_SHUTDOWN_TIMEOUT_SEC}s — sending SIGKILL"
+    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
 }
 
 # Helper: query sqlite via Python (no sqlite3 CLI dependency)
@@ -823,13 +1102,33 @@ main() {
         echo "Stop on error:     $STOP_ON_ERROR"
         echo "Inter-scenario:    ${INTER_SCENARIO_DELAY}s"
         echo "Inter-provider:    ${INTER_PROVIDER_DELAY}s"
+        if [[ "$MANAGE_VLLM" == "true" ]]; then
+            echo "vLLM:              auto-managed via ${VLLM_BACKEND} (model=${VLLM_MODEL}, bind=${VLLM_HOST}:${VLLM_PORT})"
+        fi
         echo ""
     fi
 
     # Check prerequisites
     check_sudo || true
 
-    # Check optional prerequisites
+    # Register the EXIT/INT/TERM trap *before* starting vLLM so a Ctrl-C
+    # during the (possibly several-minute) model load still triggers
+    # stop_vllm_server via cleanup_on_exit.
+    mkdir -p logs
+    trap cleanup_on_exit EXIT INT TERM
+
+    # Auto-start vLLM if requested AND the vllm phase is not disabled.
+    # (No point loading a 24 GB model just to immediately shut it back down.)
+    if [[ "$MANAGE_VLLM" == "true" ]] && phase_enabled "vllm"; then
+        if ! start_vllm_server; then
+            log_error "vLLM startup failed — aborting (set MANAGE_VLLM=false to skip vllm scenarios instead)"
+            exit 1
+        fi
+    elif [[ "$MANAGE_VLLM" == "true" ]]; then
+        log_info "MANAGE_VLLM=true but vllm phase is disabled — not starting server"
+    fi
+
+    # Check optional prerequisites (now sees the running server, if managed)
     if [[ "$QUIET_MODE" != "true" ]]; then
         check_optional_prereqs
     else
@@ -845,9 +1144,6 @@ main() {
             exit 0
         fi
     fi
-
-    mkdir -p logs
-    trap cleanup_on_exit EXIT INT TERM
 
     # Clean start if requested
     if [[ "$CLEAN_START" == "true" ]]; then

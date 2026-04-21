@@ -64,7 +64,10 @@ scenarios:
     model: "Qwen/Qwen3-VL-30B-A3B-Instruct"
     network_interface: "lo"
     stream: false
-    video_url: "file:///root/workspace/test1.mp4"
+    # Bundled test asset (~1 MB). Resolved relative to the orchestrator's
+    # CWD (aitestbed/). Override with VIDEO_PATH or by editing this entry
+    # if you have a longer benchmark clip.
+    video_path: "examples/assets/test_video.mp4"
     prompts:
       - "Describe the main actions in the video."
 
@@ -884,3 +887,4 @@ test_matrix:
     runner_enabled_by_default: true
     prereqs:
       - "http://localhost:8000/v1/models"
+      - "examples/assets/test_video.mp4"

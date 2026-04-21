@@ -288,13 +288,59 @@ sudo chmod 440 /etc/sudoers.d/testbed
 
 ### vLLM (Self-Hosted Models)
 
+Two ways to run the vLLM server. **Docker is recommended** — the
+`vllm/vllm-openai` image bundles the right CUDA runtime and Python, so it
+sidesteps `libcudart.so.12` and Python-version compatibility issues typical
+of a host-pip install.
+
+#### Docker (recommended)
+
+Requires Docker, the NVIDIA driver, and `nvidia-container-toolkit`. Add
+yourself to the `docker` group so you can manage containers without `sudo`:
+
+```bash
+sudo usermod -aG docker $USER
+newgrp docker                     # or log out / log back in
+
+# Sanity-check GPU passthrough before running scenarios:
+docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi
+```
+
+Launch the vLLM server:
+
+```bash
+docker run -d --name vllm-testbed --gpus all --ipc=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -p 127.0.0.1:8000:8000 \
+    vllm/vllm-openai:latest \
+    --model Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --max-model-len 131072 --gpu-memory-utilization 0.95 \
+    --trust-remote-code --tensor-parallel-size 1
+
+# Stop / remove when done:
+docker stop vllm-testbed && docker rm vllm-testbed
+```
+
+Then run the testbed with `MANAGE_VLLM=false` so the scripts probe the
+already-running container instead of trying to spawn another:
+
+```bash
+MANAGE_VLLM=false ./run_full_tests.sh
+MANAGE_VLLM=false ./test_vllm.sh
+```
+
+#### Host pip install (fallback — auto-managed by the scripts)
+
 ```bash
 pip install vllm
 vllm serve Qwen/Qwen3-VL-30B-A3B-Instruct \
     --host 0.0.0.0 --port 8000 \
-    --tensor-parallel-size 1 --max-model-len 32768 \
-    --gpu-memory-utilization 0.90 --trust-remote-code
+    --tensor-parallel-size 1 --max-model-len 131072 \
+    --gpu-memory-utilization 0.95 --trust-remote-code
 ```
+
+`run_full_tests.sh` and `test_vllm.sh` default to `MANAGE_VLLM=true`, which
+auto-starts and stops a host `vllm serve` process for you.
 
 vLLM scenarios use `network_interface: lo` to shape loopback traffic.
 
