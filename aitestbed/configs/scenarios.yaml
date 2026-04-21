@@ -154,7 +154,7 @@ scenarios:
     description: "Multi-threaded web search with DeepSeek synthesis"
     provider: "deepseek"
     model: "deepseek-chat"
-    search_engine: "duckduckgo"
+    search_engine: "brave"
     thread_count: 5
     search_timeout: 30.0
     max_results: 10
@@ -214,7 +214,7 @@ scenarios:
     type: "computer_use"
     description: "Computer use agent via OpenAI computer tool"
     provider: "openai"
-    model: "computer-use-preview"
+    model: "gpt-5.4"
     max_steps: 12
     execution_backend: "playwright"
     environment: "browser"
@@ -610,7 +610,7 @@ scenarios:
     description: "Multi-threaded web search without MCP, using direct HTTP"
     provider: "openai"
     model: "gpt-5-mini"
-    search_engine: "duckduckgo"  # Options: google, duckduckgo
+    search_engine: "brave"  # Options: google, duckduckgo, brave
     thread_count: 5
     search_timeout: 30.0
     max_results: 10
@@ -646,7 +646,7 @@ scenarios:
     description: "High-parallelism burst search (stress test)"
     provider: "openai"
     model: "gpt-5-mini"
-    search_engine: "duckduckgo"
+    search_engine: "brave"
     thread_count: 20
     search_timeout: 60.0
     max_results: 5
@@ -705,11 +705,12 @@ defaults:
 runner_profile_sets:
   full_suite_profiles: &full_suite_profiles
     - no_emulation
-    - ideal_6g
+    - 6g_itu_hrllc
     - 5g_urban
     - wifi_good
     - cell_edge
-    - satellite
+    - satellite_leo
+    - satellite_geo
     - congested
     - 5qi_7
     - 5qi_80
@@ -811,6 +812,7 @@ test_matrix:
     prereqs:
       - "ALPACA_API_KEY"
       - "ALPACA_SECRET_KEY"
+      - "cmd:uvx"
 
   - scenario: "trading_options_scan"
     phase: "trading"
@@ -820,6 +822,7 @@ test_matrix:
     prereqs:
       - "ALPACA_API_KEY"
       - "ALPACA_SECRET_KEY"
+      - "cmd:uvx"
 
   - scenario: "computer_control_agent"
     phase: "computer_use"

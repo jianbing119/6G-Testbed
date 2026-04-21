@@ -11,7 +11,6 @@ import time
 import yaml
 import json
 import signal
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -91,6 +90,10 @@ class TestbedOrchestrator:
         # Load configurations
         with open(self.config_path) as f:
             self.scenarios_config = yaml.safe_load(f)
+        # Re-parse profiles.yaml as a raw dict so we retain access to optional
+        # `uplink:` blocks (netemu's NetworkProfile dataclass strips them).
+        with open(self.profiles_path) as f:
+            self.profiles_config = yaml.safe_load(f) or {}
 
         # Initialize components
         self.logger = TrafficLogger(db_path)
@@ -102,6 +105,9 @@ class TestbedOrchestrator:
         # Expose the resolved interface (in case "auto" was passed)
         self.network_interface = self.emulator.interface
         self.mcp_transport = mcp_transport
+
+        # Validate any asymmetric `uplink:` blocks now so bad YAML fails fast.
+        self._validate_asymmetric_profiles()
 
         # Initialize clients (lazy loaded based on provider)
         self._clients = {}
@@ -137,6 +143,143 @@ class TestbedOrchestrator:
             "realtime_audio_webrtc": RealtimeAudioWebRTCScenario,
         }
 
+    # ------------------------------------------------------------------
+    # Asymmetric profile support (S4-260848 Table C.Z-1)
+    # ------------------------------------------------------------------
+
+    # Fields that may legally appear at the top level of a profile or
+    # inside an `uplink:` block. Mirrors NetworkProfile dataclass + the
+    # kwargs accepted by NetworkEmulator.apply_settings(). `description`
+    # and `uplink` are intentionally excluded.
+    _PROFILE_IMPAIRMENT_FIELDS = frozenset({
+        "delay_ms", "jitter_ms",
+        "delay_distribution", "delay_correlation_pct",
+        "loss_pct", "loss_correlation_pct", "loss_model",
+        "rate_mbit", "rate_ceil_mbit",
+        "rate_burst_kbit", "rate_cburst_kbit",
+        "corruption_pct", "corruption_correlation_pct",
+        "reorder_pct", "reorder_correlation_pct",
+        "duplicate_pct", "duplicate_correlation_pct",
+        "limit_packets",
+    })
+
+    def _validate_asymmetric_profiles(self) -> None:
+        """Reject malformed `uplink:` blocks at startup.
+
+        Catches: non-dict uplink, nested uplink, unknown fields. Empty
+        uplink (`uplink: {}`) is allowed and logged — treated as symmetric.
+        """
+        profiles = (self.profiles_config or {}).get("profiles", {}) or {}
+        for name, raw in profiles.items():
+            if not isinstance(raw, dict):
+                continue
+            ul = raw.get("uplink")
+            if ul is None:
+                continue
+            if not isinstance(ul, dict):
+                raise ValueError(
+                    f"profile '{name}': 'uplink:' must be a mapping, "
+                    f"got {type(ul).__name__}"
+                )
+            if not ul:
+                logger.warning(
+                    f"profile '{name}': empty uplink: block — treating as symmetric"
+                )
+                continue
+            if "uplink" in ul:
+                raise ValueError(
+                    f"profile '{name}': nested 'uplink:' is forbidden"
+                )
+            unknown = set(ul) - self._PROFILE_IMPAIRMENT_FIELDS
+            if unknown:
+                raise ValueError(
+                    f"profile '{name}': unknown key(s) under uplink: "
+                    f"{sorted(unknown)}"
+                )
+
+    def _apply_emulator_profile(
+        self, profile_name: str, ingress_profile: Optional[str]
+    ) -> bool:
+        """Apply *profile_name*, honoring the optional `uplink:` override.
+
+        Symmetric profiles fall through to ``emulator.apply_profile`` (existing
+        behavior). Asymmetric profiles are applied via ``apply_settings``,
+        which already supports an ``ingress_settings`` dict — no synthetic
+        netemu profiles are registered.
+
+        CLI ``--ingress-profile Y`` wins over a built-in ``uplink:`` block:
+        egress still uses (base ⊕ uplink), ingress uses Y's base fields.
+
+        ``no_emulation`` is a true bypass: any prior tc state is cleared and
+        no qdisc is added, so the device is observed exactly as the kernel
+        sees it (no netem queueing, no IFB).
+        """
+        # No-emulation reference baseline: skip tc/netem entirely.
+        if profile_name == "no_emulation":
+            logger.info(
+                "Profile no_emulation: clearing prior tc state and bypassing netem"
+            )
+            self.emulator.clear()
+            return True
+
+        profiles = (self.profiles_config or {}).get("profiles", {}) or {}
+        raw = profiles.get(profile_name) if isinstance(profiles, dict) else None
+        uplink = raw.get("uplink") if isinstance(raw, dict) else None
+
+        # Symmetric fast path
+        if not uplink:
+            return self.emulator.apply_profile(
+                profile_name, ingress_profile=ingress_profile
+            )
+
+        # Asymmetric — split base + uplink overrides into egress/ingress dicts
+        base = {
+            k: v for k, v in raw.items()
+            if k in self._PROFILE_IMPAIRMENT_FIELDS
+        }
+        egress = {**base, **uplink}
+
+        if ingress_profile == "none":
+            ingress_dict = None
+            disable_ingress = True
+        elif ingress_profile:
+            cli_raw = profiles.get(ingress_profile)
+            if not isinstance(cli_raw, dict):
+                raise ValueError(
+                    f"--ingress-profile '{ingress_profile}' not found in profiles.yaml"
+                )
+            ingress_dict = {
+                k: v for k, v in cli_raw.items()
+                if k in self._PROFILE_IMPAIRMENT_FIELDS
+            }
+            disable_ingress = False
+        else:
+            # Default: ingress uses the base (downlink) fields unchanged
+            ingress_dict = base
+            disable_ingress = False
+
+        logger.info(
+            f"Profile {profile_name} is asymmetric. "
+            f"uplink overrides: {sorted(uplink.keys())}"
+        )
+        if not self.emulator.bidirectional:
+            logger.warning(
+                f"Profile {profile_name} has an uplink: block but --egress-only "
+                f"is set — downlink (base) side will not be applied."
+            )
+        logger.debug(f"  egress (UL):  {egress}")
+        logger.debug(
+            f"  ingress (DL): "
+            f"{ingress_dict if ingress_dict is not None else '<egress-only>'}"
+        )
+
+        return self.emulator.apply_settings(
+            **egress,
+            profile_name=profile_name,
+            ingress_settings=ingress_dict,
+            disable_ingress=disable_ingress,
+        )
+
     def get_client(self, provider: str):
         """Get or create an LLM client for the given provider."""
         if provider not in self._clients:
@@ -157,10 +300,13 @@ class TestbedOrchestrator:
         return self._clients[provider]
 
     def get_completed_runs(self, scenario_name: str, profile_name: str) -> int:
-        """Query the DB for the number of completed successful runs.
+        """Query the DB for the number of completed runs (successful or timed out).
 
-        A "completed run" is a distinct session_id where every record has
-        success=1 for the given scenario+profile combination.
+        A "completed run" is a distinct session_id for the given
+        scenario+profile that either succeeded on every record OR is a
+        timeout placeholder.  Timed-out runs are legitimate data points
+        (the network conditions *are* the cause) and must not be retried
+        on resume.
         """
         import sqlite3
         try:
@@ -170,13 +316,15 @@ class TestbedOrchestrator:
                     SELECT COUNT(DISTINCT session_id) FROM traffic_logs
                     WHERE scenario_id = ?
                       AND network_profile = ?
-                      AND session_id NOT LIKE 'timeout_%'
                       AND session_id NOT LIKE 'pcap_%'
-                      AND session_id NOT IN (
-                          SELECT DISTINCT session_id FROM traffic_logs
-                          WHERE scenario_id = ?
-                            AND network_profile = ?
-                            AND success = 0
+                      AND (
+                          session_id LIKE 'timeout_%'
+                          OR session_id NOT IN (
+                              SELECT DISTINCT session_id FROM traffic_logs
+                              WHERE scenario_id = ?
+                                AND network_profile = ?
+                                AND success = 0
+                          )
                       )
                 """, (scenario_name, profile_name, scenario_name, profile_name))
                 count = cursor.fetchone()[0]
@@ -232,6 +380,29 @@ class TestbedOrchestrator:
         if not scenario_class:
             raise ValueError(f"Unknown scenario type: {scenario_type}")
 
+        defaults = self.scenarios_config.get("defaults", {})
+        retry_count = int(defaults.get("retry_count", 0))
+        retry_backoff_sec = float(defaults.get("retry_backoff_sec", 1.0))
+        retry_backoff_multiplier = float(defaults.get("retry_backoff_multiplier", 2.0))
+
+        # Resume: check before any expensive setup (client init, network
+        # profile application) so fully-completed combos are skipped cheaply.
+        start_run = 0
+        if resume:
+            completed = self.get_completed_runs(scenario_name, profile_name)
+            if completed >= runs:
+                logger.info(
+                    f"Skipping {scenario_name}/{profile_name}: "
+                    f"all {runs} runs already completed ({completed} in DB)"
+                )
+                return []
+            if completed > 0:
+                start_run = completed
+                logger.info(
+                    f"Resuming {scenario_name}/{profile_name} from run "
+                    f"{start_run + 1}/{runs} ({completed} already completed)"
+                )
+
         # Get provider and client
         provider = scenario_config.get("provider", "openai")
         client = self.get_client(provider)
@@ -253,32 +424,10 @@ class TestbedOrchestrator:
             logger.info(f"Applying network profile: egress={profile_name}, ingress={ingress_profile}")
         else:
             logger.info(f"Applying network profile: {profile_name} (bidirectional)")
-        if not self.emulator.apply_profile(profile_name, ingress_profile=ingress_profile):
+        if not self._apply_emulator_profile(profile_name, ingress_profile):
             logger.warning(f"Failed to apply network profile (may require sudo)")
 
         results = []
-        defaults = self.scenarios_config.get("defaults", {})
-        retry_count = int(defaults.get("retry_count", 0))
-        retry_backoff_sec = float(defaults.get("retry_backoff_sec", 1.0))
-        retry_backoff_multiplier = float(defaults.get("retry_backoff_multiplier", 2.0))
-
-        # Resume: skip already-completed runs
-        start_run = 0
-        if resume:
-            completed = self.get_completed_runs(scenario_name, profile_name)
-            if completed >= runs:
-                logger.info(
-                    f"Skipping {scenario_name}/{profile_name}: "
-                    f"all {runs} runs already completed ({completed} in DB)"
-                )
-                self.emulator.clear()
-                return results
-            if completed > 0:
-                start_run = completed
-                logger.info(
-                    f"Resuming {scenario_name}/{profile_name} from run "
-                    f"{start_run + 1}/{runs} ({completed} already completed)"
-                )
 
         try:
             for run_index in range(start_run, runs):
@@ -315,6 +464,24 @@ class TestbedOrchestrator:
                     attempt += 1
 
                 results.append(result)
+
+                # Persist timeout results to the DB so that --resume
+                # counts them as completed and does not retry them.
+                if not result.log_records and result.session_id.startswith("timeout_"):
+                    timeout_record = LogRecord(
+                        timestamp=time.time(),
+                        scenario_id=scenario_name,
+                        session_id=result.session_id,
+                        turn_index=0,
+                        run_index=run_index,
+                        provider=scenario_config.get("provider", ""),
+                        model=scenario_config.get("model", ""),
+                        network_profile=profile_name,
+                        latency_sec=result.total_latency_sec,
+                        success=False,
+                        error_type="timeout",
+                    )
+                    self.logger.log(timeout_record)
 
                 logger.info(
                     f"  Completed: success={result.success}, "
@@ -364,45 +531,78 @@ class TestbedOrchestrator:
     ) -> ScenarioResult:
         """Run a single scenario with a per-run timeout.
 
-        Uses a thread pool so the main thread can enforce the deadline.
-        If the run exceeds *timeout_sec*, a failed ScenarioResult is returned
-        with the timeout noted in the error message.
+        Uses a *daemon* thread + queue so that (a) the main thread can
+        enforce the deadline and (b) if the run blocks in uninterruptible
+        I/O, the zombie worker cannot keep the Python interpreter alive
+        after the main process decides to exit. ThreadPoolExecutor is
+        intentionally not used here because its workers are non-daemon —
+        on a timeout they would outlive both the run and any subsequent
+        RunFailedError, polluting later metrics and preventing clean
+        shutdown.
         """
+        import queue as _queue
+        import threading
+
+        result_q: "_queue.Queue[tuple[str, object]]" = _queue.Queue(maxsize=1)
+
         def _run_in_thread():
-            """Wrapper that ensures an event loop exists for async scenarios."""
             import asyncio
             try:
                 asyncio.get_event_loop()
             except RuntimeError:
                 asyncio.set_event_loop(asyncio.new_event_loop())
-            return scenario.run(network_profile=profile_name, run_index=run_index)
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_run_in_thread)
             try:
-                return future.result(timeout=timeout_sec)
-            except FuturesTimeoutError:
-                logger.warning(
-                    f"  Run {run_index + 1} of {scenario_name} timed out "
-                    f"after {timeout_sec:.0f}s"
+                r = scenario.run(
+                    network_profile=profile_name, run_index=run_index
                 )
-                # Build a failed result so the run is recorded
-                return ScenarioResult(
-                    scenario_id=scenario_name,
-                    session_id=f"timeout_{int(time.time())}",
-                    network_profile=profile_name,
-                    run_index=run_index,
-                    success=False,
-                    total_latency_sec=timeout_sec,
-                    error_message=f"Run timed out after {timeout_sec:.0f}s",
-                )
+                result_q.put(("ok", r))
+            except BaseException as exc:  # noqa: BLE001 — forward everything
+                result_q.put(("err", exc))
+
+        worker = threading.Thread(
+            target=_run_in_thread,
+            name=f"scenario-{scenario_name}-run{run_index}",
+            daemon=True,
+        )
+        worker.start()
+
+        try:
+            kind, payload = result_q.get(timeout=timeout_sec)
+        except _queue.Empty:
+            logger.warning(
+                f"  Run {run_index + 1} of {scenario_name} timed out "
+                f"after {timeout_sec:.0f}s (worker thread abandoned as daemon)"
+            )
+            # Don't join the worker: if the scenario is blocked in a
+            # no-timeout HTTP call on a high-latency profile, join would
+            # hang the suite. daemon=True ensures it dies with the process.
+            return ScenarioResult(
+                scenario_id=scenario_name,
+                session_id=f"timeout_{int(time.time())}",
+                network_profile=profile_name,
+                run_index=run_index,
+                success=False,
+                total_latency_sec=timeout_sec,
+                error_message=f"Run timed out after {timeout_sec:.0f}s",
+            )
+
+        if kind == "err":
+            # Re-raise so the normal run_experiment error path handles it
+            raise payload  # type: ignore[misc]
+        return payload  # type: ignore[return-value]
 
     def _get_retry_reason(self, result: ScenarioResult) -> Optional[str]:
-        """Return a retry reason for transient failures."""
+        """Return a retry reason for transient failures.
+
+        Note: run-level timeouts (enforced by _run_with_timeout) are NOT
+        retried. On slow network profiles (satellite, congested) a timeout
+        almost always means the scenario/profile combination legitimately
+        exceeds the budget — retrying just stacks zombie threads from the
+        previous run and guarantees more timeouts. Per-request HTTP timeouts
+        surfaced as LogRecord error_type are also treated as terminal here.
+        """
         if not result.log_records:
             error_text = (result.error_message or "").lower()
-            if "timeout" in error_text or "timed out" in error_text:
-                return "timeout"
             if "rate limit" in error_text or "429" in error_text:
                 return "rate_limited"
             return None
@@ -417,10 +617,6 @@ class TestbedOrchestrator:
                 return "rate_limited"
             if record.http_status and 500 <= record.http_status < 600 and record.http_status != 501:
                 return "server_error"
-
-            error_type = (record.error_type or "").lower()
-            if "timeout" in error_type or "timed out" in error_type:
-                return "timeout"
 
         return None
 
@@ -658,6 +854,26 @@ def main():
         help="Directory for pcap captures"
     )
     parser.add_argument(
+        "--capture-loopback",
+        action="store_true",
+        default=True,
+        help="When MCP transport is http, also capture loopback (lo) so MCP "
+             "JSON-RPC frames are visible in pcap. Enabled by default. "
+             "Use --no-capture-loopback to disable."
+    )
+    parser.add_argument(
+        "--no-capture-loopback",
+        dest="capture_loopback",
+        action="store_false",
+        help="Disable the secondary loopback capture (mirror flag)."
+    )
+    parser.add_argument(
+        "--capture-loopback-filter",
+        default=None,
+        help="BPF filter for the loopback capture. Defaults to "
+             "'tcp and not port 22 and not port 53'."
+    )
+    parser.add_argument(
         "--capture-l7",
         action="store_true",
         help="Enable L7 capture using mitmproxy"
@@ -738,6 +954,11 @@ def main():
     pcap_start_time = None
     pcap_file = None
     l7_controller = None
+    pcap_lo_controller = None
+    pcap_lo_file = None
+    # run_id ties primary + loopback pcaps to the same orchestrator invocation,
+    # so post-hoc joins do not have to rely on overlapping timestamps.
+    run_id = f"run_{int(time.time())}_{abs(hash(repr(vars(args)))) % 100000:05d}"
     try:
         if args.capture_pcap:
             try:
@@ -755,6 +976,43 @@ def main():
                 logger.warning(f"Failed to start tcpdump capture: {e}")
                 pcap_controller = None
                 pcap_start_time = None
+
+            # Secondary loopback capture for MCP-over-HTTP traffic. The MCP
+            # client (clients/mcp_client.py:MCPHttpConnection) POSTs JSON-RPC
+            # to 127.0.0.1:<auto-port>; that traffic only appears on `lo` and
+            # is invisible to the primary capture when the primary interface
+            # is anything other than `lo` itself.
+            primary_iface = orchestrator.network_interface or ""
+            if (
+                args.capture_pcap
+                and args.capture_loopback
+                and primary_iface != "lo"
+                and orchestrator.mcp_transport == "http"
+            ):
+                try:
+                    from capture import CaptureController
+                    pcap_lo_controller = CaptureController(
+                        interface="lo",
+                        capture_dir=args.capture_dir,
+                    )
+                    # Filter out SSH/DNS noise; keep everything else on lo
+                    # (MCP HTTP servers use ephemeral ports we cannot enumerate
+                    # ahead of time, so a port-range filter is not possible).
+                    lo_filter = args.capture_loopback_filter or (
+                        "tcp and not port 22 and not port 53"
+                    )
+                    lo_filename = (
+                        f"capture_lo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pcap"
+                    )
+                    pcap_lo_file = pcap_lo_controller.start(
+                        filename=lo_filename, filter_expr=lo_filter
+                    )
+                    if not pcap_lo_file:
+                        logger.warning("Failed to start loopback tcpdump capture")
+                        pcap_lo_controller = None
+                except Exception as e:
+                    logger.warning(f"Failed to start loopback tcpdump capture: {e}")
+                    pcap_lo_controller = None
 
         if args.capture_l7:
             try:
@@ -894,6 +1152,8 @@ def main():
                         "capture_filter": args.capture_filter,
                         "capture_duration_sec": capture_duration,
                         "capture_stats": capture_stats,
+                        "interface": orchestrator.network_interface,
+                        "run_id": run_id,
                     }
 
                     capture_record = LogRecord(
@@ -916,6 +1176,62 @@ def main():
                     orchestrator.logger.log(capture_record)
             except Exception as e:
                 logger.warning(f"Failed to stop tcpdump capture cleanly: {e}")
+
+        if pcap_lo_controller:
+            try:
+                pcap_lo_stop_time = time.time()
+                pcap_lo_path = pcap_lo_controller.stop()
+                if pcap_lo_path:
+                    lo_stats = pcap_lo_controller.get_capture_stats(pcap_lo_path)
+                    lo_duration = None
+                    if pcap_start_time is not None:
+                        lo_duration = pcap_lo_stop_time - pcap_start_time
+
+                    scenario_id_lo = args.scenario if args.scenario else "unknown"
+                    if args.scenario == "all":
+                        scenario_id_lo = "test_matrix"
+
+                    network_profile_lo = (
+                        args.profile if args.scenario and args.scenario != "all" else "multiple"
+                    )
+
+                    pcap_lo_size = 0
+                    try:
+                        pcap_lo_size = pcap_lo_path.stat().st_size
+                    except Exception:
+                        pass
+
+                    lo_metadata = {
+                        "type": "pcap_capture",
+                        "pcap_file": str(pcap_lo_path),
+                        "capture_dir": args.capture_dir,
+                        "capture_filter": args.capture_loopback_filter or "tcp and not port 22 and not port 53",
+                        "capture_duration_sec": lo_duration,
+                        "capture_stats": lo_stats,
+                        "interface": "lo",
+                        "run_id": run_id,
+                    }
+
+                    lo_record = LogRecord(
+                        timestamp=time.time(),
+                        scenario_id=scenario_id_lo,
+                        session_id=f"pcap_lo_{int(pcap_start_time or time.time())}",
+                        turn_index=-2,
+                        run_index=-1,
+                        provider="tcpdump",
+                        model="",
+                        request_bytes=0,
+                        response_bytes=pcap_lo_size,
+                        t_request_start=pcap_start_time or 0.0,
+                        latency_sec=lo_duration or 0.0,
+                        network_profile=network_profile_lo,
+                        http_status=200,
+                        success=True,
+                        metadata=json.dumps(lo_metadata),
+                    )
+                    orchestrator.logger.log(lo_record)
+            except Exception as e:
+                logger.warning(f"Failed to stop loopback tcpdump capture cleanly: {e}")
 
 
 if __name__ == "__main__":

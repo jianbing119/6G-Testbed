@@ -6,11 +6,15 @@ Implements agentic AI patterns with real MCP tool execution.
 
 import asyncio
 import json
+import logging
 import os
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 from typing import Optional, Any
+
+logger = logging.getLogger(__name__)
 
 import yaml
 
@@ -276,11 +280,14 @@ class BaseAgentScenario(BaseScenario):
             raise RuntimeError("Failed to connect to any MCP servers")
         print(f"Connected. Available tools: {[t.name for t in self.tool_executor.mcp_client.get_tools()]}")
 
-        # Apply netem to loopback for HTTP-mode MCP servers
+        # Apply netem to loopback for HTTP-mode MCP servers.
+        # Skip for the no_emulation reference profile: that profile is meant
+        # to leave lo completely unshaped (no netem queueing on MCP traffic).
         if (
             self.mcp_transport == "http"
             and self.emulator is not None
             and self._current_network_profile
+            and self._current_network_profile != "no_emulation"
             and self.tool_executor.http_ports
         ):
             for name, port in self.tool_executor.http_ports.items():
@@ -314,6 +321,117 @@ class BaseAgentScenario(BaseScenario):
         """Execute the agent scenario asynchronously."""
         raise NotImplementedError
 
+    # ------------------------------------------------------------------
+    # Diagnostic helpers
+    # ------------------------------------------------------------------
+
+    def _snapshot_request(
+        self,
+        model: str,
+        messages: list,
+        tools: Optional[list],
+        iteration: int,
+    ) -> dict:
+        """Build a JSON-safe snapshot of an outgoing LLM request.
+
+        Used by the exception path in _run_agent_turn so that when a provider
+        rejects the request (e.g. HTTP 400) we still have a concrete record
+        of what was sent. Content is previewed rather than dumped verbatim
+        to keep the log DB compact.
+        """
+        preview_chars = 400
+        msg_snapshots = []
+        last_tool_call = None
+        for idx, m in enumerate(messages):
+            content = getattr(m, "content", None)
+            role = getattr(m, "role", None)
+            role_str = role.value if hasattr(role, "value") else str(role)
+            content_str = content if isinstance(content, str) else repr(content)
+            if content_str and content_str.startswith("Tool result from "):
+                # e.g. "Tool result from get_current_weather:\n{...}"
+                try:
+                    last_tool_call = content_str.split(":", 1)[0].replace(
+                        "Tool result from ", ""
+                    )
+                except Exception:
+                    pass
+            msg_snapshots.append({
+                "index": idx,
+                "role": role_str,
+                "content_type": type(content).__name__,
+                "content_len": len(content_str) if content_str else 0,
+                "content_preview": (content_str or "")[:preview_chars],
+                "tool_call_id": getattr(m, "tool_call_id", None),
+            })
+
+        return {
+            "iteration": iteration,
+            "model": model,
+            "message_count": len(messages),
+            "tool_count": len(tools) if tools else 0,
+            "tool_names": [
+                t.get("function", {}).get("name") for t in (tools or [])
+            ],
+            "messages": msg_snapshots,
+            "last_tool_call": last_tool_call,
+            "total_content_chars": sum(
+                len(s["content_preview"]) for s in msg_snapshots
+            ),
+        }
+
+    def _validate_json_safety(
+        self,
+        obj: Any,
+        context: str,
+        log: bool = True,
+    ) -> list:
+        """Walk *obj* and flag values that would produce invalid JSON.
+
+        Specifically looks for float NaN/Infinity (Python's json.dumps emits
+        these as bare `NaN`/`Infinity` tokens with allow_nan=True, which are
+        not legal JSON and are rejected by OpenAI with HTTP 400 "could not
+        parse the JSON body"), plus bytes and other non-JSON-native types.
+        Returns a list of issue descriptions; emits a WARNING for each when
+        *log* is True.
+        """
+        import math
+
+        issues: list = []
+
+        def _walk(node: Any, path: str) -> None:
+            if isinstance(node, float):
+                if math.isnan(node):
+                    issues.append(f"NaN at {path}")
+                elif math.isinf(node):
+                    issues.append(f"Infinity at {path}")
+            elif isinstance(node, (bytes, bytearray)):
+                issues.append(f"bytes ({len(node)}B) at {path}")
+            elif isinstance(node, dict):
+                for k, v in node.items():
+                    _walk(v, f"{path}.{k}")
+            elif isinstance(node, (list, tuple)):
+                for i, v in enumerate(node):
+                    _walk(v, f"{path}[{i}]")
+            elif node is None or isinstance(node, (str, int, bool)):
+                return
+            else:
+                issues.append(
+                    f"non-JSON-native {type(node).__name__} at {path}"
+                )
+
+        try:
+            _walk(obj, "$")
+        except Exception as e:
+            issues.append(f"walker crashed: {type(e).__name__}: {e}")
+
+        if issues and log:
+            logger.warning(
+                "JSON-safety issues in %s: %s",
+                context,
+                issues[:20],
+            )
+        return issues
+
     async def _run_agent_turn(
         self,
         user_prompt: str,
@@ -346,8 +464,25 @@ class BaseAgentScenario(BaseScenario):
         # Get available tools
         tools = self.tool_executor.get_tools_for_openai()
 
+        # Flag suspect tool schemas up front (NaN defaults, non-serializable
+        # values) — these would corrupt every subsequent request.
+        self._validate_json_safety(
+            {"tools": tools},
+            context=f"{self.scenario_id} tools schema",
+        )
+
         for iteration in range(self.max_iterations):
             t_start = time.time()
+
+            # Snapshot the outgoing request in a JSON-safe form so the
+            # exception handler below has something concrete to log when
+            # the server rejects the body.
+            pending_request = self._snapshot_request(
+                model=model,
+                messages=messages,
+                tools=tools,
+                iteration=iteration,
+            )
 
             try:
                 response: ChatResponse = self.client.chat(
@@ -436,6 +571,16 @@ class BaseAgentScenario(BaseScenario):
                         role=MessageRole.ASSISTANT,
                         content=response.content or f"Calling {tool_call.name}..."
                     ))
+
+                    # Check the raw tool result for values that would
+                    # corrupt downstream JSON serialization (e.g. NaN from
+                    # weather APIs). We warn but do not abort: the agent
+                    # loop will still substitute the string representation
+                    # into the next prompt.
+                    self._validate_json_safety(
+                        tool_result.result,
+                        context=f"tool_result from {tool_call.name}",
+                    )
 
                     # Add tool result (truncated to avoid context overflow)
                     if tool_result.success:
@@ -549,6 +694,54 @@ class BaseAgentScenario(BaseScenario):
                 turn_result["success"] = False
                 turn_result["error"] = str(e)
 
+                # Extract HTTP status from providers that surface it on
+                # the exception (OpenAI SDK -> APIStatusError has .status_code).
+                http_status = getattr(e, "status_code", None) or 0
+
+                # Produce a diagnostic dump: the request snapshot + any
+                # JSON-safety violations we can detect after the fact.
+                diagnostic = {
+                    "iteration": iteration,
+                    "exception_type": type(e).__name__,
+                    "exception_message": str(e),
+                    "http_status": http_status,
+                    "pending_request": pending_request,
+                    "json_safety_issues": self._validate_json_safety(
+                        pending_request,
+                        context=f"{self.scenario_id} failed request",
+                        log=False,
+                    ),
+                }
+                # Some SDKs expose the raw response body on the exception
+                for attr in ("response", "body", "message"):
+                    val = getattr(e, attr, None)
+                    if val is not None and attr != "message":
+                        try:
+                            diagnostic[f"exc_{attr}"] = (
+                                val.text if hasattr(val, "text") else repr(val)[:2000]
+                            )
+                        except Exception:
+                            pass
+
+                logger.error(
+                    "LLM call failed in %s turn=%d iter=%d: %s: %s "
+                    "(http=%s, messages=%d, tools=%d, last_tool=%s, json_issues=%s)",
+                    self.scenario_id,
+                    turn_index,
+                    iteration,
+                    type(e).__name__,
+                    str(e)[:300],
+                    http_status,
+                    len(messages),
+                    len(tools) if tools else 0,
+                    pending_request.get("last_tool_call"),
+                    diagnostic["json_safety_issues"] or "none",
+                )
+                logger.debug(
+                    "Full failing request snapshot:\n%s",
+                    json.dumps(pending_request, indent=2, default=str)[:8000],
+                )
+
                 record = self._create_log_record(
                     session_id=session_id,
                     turn_index=turn_index,
@@ -556,9 +749,12 @@ class BaseAgentScenario(BaseScenario):
                     network_profile=network_profile,
                     t_request_start=t_start,
                     latency_sec=time.time() - t_start,
-                    http_status=0,
-                    error_type=str(e),
+                    http_status=http_status,
+                    error_type=f"{type(e).__name__}: {str(e)[:500]}",
                     success=False,
+                    trace_request=pending_request,
+                    trace_response=diagnostic,
+                    trace_note="agent_chat_error",
                 )
                 self.logger.log(record)
                 turn_result["log_records"].append(record)

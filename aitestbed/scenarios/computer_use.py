@@ -368,7 +368,7 @@ class ComputerUseScenario(BaseScenario):
     def _build_tool_output(self, call: ComputerToolCall, action_result: dict) -> dict:
         screenshot_b64 = action_result.get("screenshot_b64", "")
         output_payload = {
-            "type": "computer_screenshot",
+            "type": "input_image",
             "image_url": f"data:image/png;base64,{screenshot_b64}" if screenshot_b64 else "",
         }
         output_type = "computer_call_output" if call.call_type == "computer_call" else "tool_call_output"
@@ -389,12 +389,17 @@ class ComputerUseScenario(BaseScenario):
         step_index: int,
         previous_response_id: Optional[str] = None,
     ) -> tuple[Any, LogRecord]:
-        tool_payload = {
-            "type": "computer_use_preview",
-            "display_width": int(self.config.get("viewport", {}).get("width", 1024)),
-            "display_height": int(self.config.get("viewport", {}).get("height", 768)),
-            "environment": self.config.get("environment", "browser"),
-        }
+        # gpt-5.4+ uses the "computer" tool type with no extra params;
+        # older models used "computer_use_preview" with explicit dimensions.
+        if "computer-use-preview" in model:
+            tool_payload = {
+                "type": "computer_use_preview",
+                "display_width": int(self.config.get("viewport", {}).get("width", 1024)),
+                "display_height": int(self.config.get("viewport", {}).get("height", 768)),
+                "environment": self.config.get("environment", "browser"),
+            }
+        else:
+            tool_payload = {"type": "computer"}
         payload: dict[str, Any] = {
             "model": model,
             "tools": [tool_payload],

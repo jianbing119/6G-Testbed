@@ -26,6 +26,7 @@ class SearchEngine(Enum):
     """Supported search engines."""
     GOOGLE = "google"
     DUCKDUCKGO = "duckduckgo"
+    BRAVE = "brave"
 
 
 @dataclass
@@ -85,12 +86,14 @@ class DirectSearchClient:
         engine: SearchEngine = SearchEngine.DUCKDUCKGO,
         google_api_key: Optional[str] = None,
         google_cx: Optional[str] = None,
+        brave_api_key: Optional[str] = None,
         timeout: float = 30.0,
         max_results: int = 10,
     ):
         self.engine = engine
         self.google_api_key = google_api_key or os.environ.get("GOOGLE_SEARCH_API_KEY")
         self.google_cx = google_cx or os.environ.get("GOOGLE_SEARCH_CX")
+        self.brave_api_key = brave_api_key or os.environ.get("BRAVE_API_KEY")
         self.timeout = timeout
         self.max_results = max_results
 
@@ -104,6 +107,8 @@ class DirectSearchClient:
         """Perform a search using the configured engine."""
         if self.engine == SearchEngine.GOOGLE:
             return self._search_google(query)
+        elif self.engine == SearchEngine.BRAVE:
+            return self._search_brave(query)
         else:
             return self._search_duckduckgo(query)
 
@@ -134,7 +139,7 @@ class DirectSearchClient:
             result.http_status = response.status_code
             result.response_bytes = len(response.content)
 
-            if response.status_code == 200:
+            if 200 <= response.status_code < 300:
                 data = response.json()
                 result.results = [
                     {
@@ -145,6 +150,65 @@ class DirectSearchClient:
                     for item in data.get("items", [])
                 ]
                 result.success = True
+            else:
+                result.error = f"HTTP {response.status_code}: {response.text[:200]}"
+                result.raw_response = response.text[:1000]
+
+        except requests.exceptions.Timeout:
+            result.latency_sec = time.time() - t_start
+            result.error = "Request timeout"
+        except requests.exceptions.RequestException as e:
+            result.latency_sec = time.time() - t_start
+            result.error = str(e)
+        except json.JSONDecodeError as e:
+            result.latency_sec = time.time() - t_start
+            result.error = f"JSON decode error: {e}"
+
+        return result
+
+    def _search_brave(self, query: str) -> SearchResult:
+        """Search using Brave Search API."""
+        result = SearchResult(query=query, engine=SearchEngine.BRAVE, success=False)
+
+        if not self.brave_api_key:
+            result.error = "Brave API key not configured"
+            return result
+
+        url = "https://api.search.brave.com/res/v1/web/search"
+        params = {
+            "q": query,
+            "count": min(self.max_results, 20),
+        }
+        headers = {
+            "Accept": "application/json",
+            "X-Subscription-Token": self.brave_api_key,
+        }
+
+        t_start = time.time()
+        try:
+            request_url = f"{url}?{urllib.parse.urlencode(params)}"
+            result.request_bytes = len(request_url.encode())
+
+            response = self.session.get(
+                url, params=params, headers=headers, timeout=self.timeout
+            )
+            result.latency_sec = time.time() - t_start
+            result.http_status = response.status_code
+            result.response_bytes = len(response.content)
+
+            if 200 <= response.status_code < 300:
+                data = response.json()
+                result.results = [
+                    {
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "snippet": item.get("description", ""),
+                    }
+                    for item in data.get("web", {}).get("results", [])
+                ]
+                result.success = len(result.results) > 0
+                if not result.success:
+                    result.error = "No results returned from Brave Search"
             else:
                 result.error = f"HTTP {response.status_code}: {response.text[:200]}"
                 result.raw_response = response.text[:1000]
@@ -194,7 +258,7 @@ class DirectSearchClient:
             result.http_status = response.status_code
             result.response_bytes = len(response.content)
 
-            if response.status_code == 200:
+            if 200 <= response.status_code < 300:
                 # Parse HTML response
                 result.results = self._parse_duckduckgo_html(response.text)
                 result.success = len(result.results) > 0

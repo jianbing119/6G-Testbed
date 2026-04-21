@@ -24,6 +24,20 @@ except ImportError:
 
 
 @dataclass
+class PacketRecord:
+    """A single captured packet with timing and size."""
+    timestamp: float
+    size: int          # IP payload length in bytes
+    direction: str     # "ul" or "dl"
+    tcp_flags: int = 0
+    seq: int = 0
+    ack: int = 0
+    window: int = 0
+    payload_len: int = 0  # TCP payload (data only, excl. headers)
+    flow_key: str = ""
+
+
+@dataclass
 class TCPFlow:
     """Represents a TCP flow (connection) with metrics."""
     src_ip: str
@@ -47,6 +61,9 @@ class TCPFlow:
     syn_time: Optional[float] = None
     syn_ack_time: Optional[float] = None
     ack_time: Optional[float] = None
+    first_data_time: Optional[float] = None   # first packet with payload > 0
+    fin_time: Optional[float] = None
+    rst_time: Optional[float] = None
     retransmissions: int = 0
 
     # Sequence tracking for retransmission detection
@@ -103,6 +120,29 @@ class TCPFlow:
         return 0.0
 
     @property
+    def handshake_duration(self) -> Optional[float]:
+        """Full TCP handshake duration (SYN → 3rd ACK) in seconds."""
+        if self.syn_time and self.ack_time:
+            return self.ack_time - self.syn_time
+        return None
+
+    @property
+    def time_to_first_data(self) -> Optional[float]:
+        """SYN → first data byte, approximates handshake + TLS setup."""
+        if self.syn_time and self.first_data_time:
+            return self.first_data_time - self.syn_time
+        return None
+
+    @property
+    def data_transfer_duration(self) -> Optional[float]:
+        """First data byte → connection close (FIN/RST/last packet)."""
+        start = self.first_data_time
+        end = self.fin_time or self.rst_time or self.end_time
+        if start and end and end > start:
+            return end - start
+        return None
+
+    @property
     def flow_key(self) -> str:
         """Unique flow identifier."""
         return f"{self.src_ip}:{self.src_port}-{self.dst_ip}:{self.dst_port}"
@@ -147,6 +187,9 @@ class PcapMetrics:
     # Time series data for plotting
     throughput_timeseries: list[tuple[float, float, float]] = field(default_factory=list)
     # List of (timestamp, ul_kbps, dl_kbps)
+
+    # Per-packet records (for sub-second and packet-by-packet analysis)
+    packets: list[PacketRecord] = field(default_factory=list)
 
     # Per-flow data
     flows: list[TCPFlow] = field(default_factory=list)
@@ -256,7 +299,7 @@ class PcapAnalyzer:
                                     continue
 
                             # Process TCP flow
-                            flow = self._process_tcp_packet(
+                            flow, flags, tcp_payload_len = self._process_tcp_packet(
                                 flows, ts, src_ip, dst_ip, tcp, len(ip.data)
                             )
 
@@ -264,9 +307,24 @@ class PcapAnalyzer:
                             bucket = int(ts / bucket_sec)
                             # Determine direction (simple heuristic: lower port is server)
                             if tcp.sport < tcp.dport:
+                                direction = "dl"
                                 throughput_buckets[bucket]["dl_bytes"] += len(ip.data)
                             else:
+                                direction = "ul"
                                 throughput_buckets[bucket]["ul_bytes"] += len(ip.data)
+
+                            # Record per-packet data
+                            metrics.packets.append(PacketRecord(
+                                timestamp=ts,
+                                size=len(ip.data),
+                                direction=direction,
+                                tcp_flags=flags,
+                                seq=tcp.seq,
+                                ack=tcp.ack,
+                                window=tcp.win,
+                                payload_len=tcp_payload_len,
+                                flow_key=flow.flow_key,
+                            ))
 
                         elif isinstance(ip.data, dpkt.udp.UDP):
                             metrics.udp_packets += 1
@@ -391,7 +449,7 @@ class PcapAnalyzer:
             flow.packets_recv += 1
             flow.bytes_recv += payload_len
 
-        # Track TCP flags for handshake RTT
+        # Track TCP flags for handshake and connection lifecycle
         flags = tcp.flags
 
         # SYN (no ACK) - connection initiation
@@ -408,13 +466,26 @@ class PcapAnalyzer:
         elif (flags & dpkt.tcp.TH_ACK) and flow.syn_ack_time and not flow.ack_time:
             flow.ack_time = ts
 
+        # FIN
+        if (flags & dpkt.tcp.TH_FIN) and flow.fin_time is None:
+            flow.fin_time = ts
+
+        # RST
+        if (flags & dpkt.tcp.TH_RST) and flow.rst_time is None:
+            flow.rst_time = ts
+
+        # First data packet (payload > TCP headers)
+        tcp_payload_len = payload_len - (tcp.off * 4) if payload_len > tcp.off * 4 else 0
+        if tcp_payload_len > 0 and flow.first_data_time is None:
+            flow.first_data_time = ts
+
         # Detect retransmissions (simplified: same seq number seen before)
         seq = tcp.seq
         if seq in flow.seen_seqs and payload_len > 0:
             flow.retransmissions += 1
         flow.seen_seqs.add(seq)
 
-        return flow
+        return flow, flags, tcp_payload_len
 
     @staticmethod
     def _ip_to_str(ip_bytes: bytes) -> str:

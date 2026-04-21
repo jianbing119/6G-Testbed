@@ -28,10 +28,12 @@ TRACE_LOG_DIR=${TRACE_LOG_DIR:-logs/traces}
 CAPTURE_PCAP=${CAPTURE_PCAP:-true}  # Enable L3/L4 packet capture by default
 CAPTURE_DIR=${CAPTURE_DIR:-results/captures}
 CAPTURE_FILTER=${CAPTURE_FILTER:-"port 443 or port 80 or port 8080 or port 8000"}  # HTTPS, HTTP, proxy, and vLLM
+CAPTURE_LOOPBACK=${CAPTURE_LOOPBACK:-true}  # Secondary tcpdump on lo for MCP-over-HTTP frames
+MCP_TRANSPORT=${MCP_TRANSPORT:-http}  # MCP server transport: http (default, netem-shaped) or stdio
 ANONYMIZE_DB=${ANONYMIZE_DB:-true}  # Anonymize provider/model names by default
 CLEAN_START=${CLEAN_START:-true}  # Start from a clean database by default
 NETWORK_INTERFACE=${NETWORK_INTERFACE:-auto}  # Network interface for emulation + capture (auto = detect)
-RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-600}  # Per-run timeout in seconds (0 = no timeout)
+RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-300}  # Per-run timeout in seconds (0 = no timeout)
 STOP_ON_ERROR=${STOP_ON_ERROR:-true}  # Stop on first failed run (default: true)
 RESUME_MODE=${RESUME_MODE:-false}  # Resume from last successful run
 QUIET_MODE=${QUIET_MODE:-true}  # Show progress bar instead of verbose output
@@ -277,6 +279,103 @@ PY
     PROGRESS_DONE=0
 }
 
+# Filter out already-completed scenario/profile combos from the test matrix.
+# Only useful in resume mode — queries the DB once up front so the main loop
+# never even sees entries that have nothing left to run.
+filter_completed_from_matrix() {
+    local db="logs/traffic_logs.db"
+    if [[ ! -f "$db" ]]; then
+        return
+    fi
+
+    local original_count=${#TEST_MATRIX_ENTRIES[@]}
+    local filtered=()
+
+    # Build a lookup of completed counts: "scenario|profile" -> count
+    # Single DB query for all combos.
+    declare -A completed_counts
+    while IFS=$'\t' read -r scenario profile count; do
+        completed_counts["${scenario}|${profile}"]=$count
+    done < <(
+        python - "$db" "$RUNS_PER_SCENARIO" <<'PY'
+import sqlite3, sys
+
+db_path, runs_needed = sys.argv[1], int(sys.argv[2])
+try:
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("""
+        SELECT scenario_id, network_profile, COUNT(DISTINCT session_id)
+        FROM traffic_logs
+        WHERE session_id NOT LIKE 'pcap_%'
+          AND (
+              session_id LIKE 'timeout_%'
+              OR session_id NOT IN (
+                  SELECT DISTINCT session_id FROM traffic_logs
+                  WHERE success = 0
+              )
+          )
+        GROUP BY scenario_id, network_profile
+    """).fetchall()
+    for scenario, profile, count in rows:
+        print(f"{scenario}\t{profile}\t{count}")
+except Exception:
+    pass
+PY
+    )
+
+    local skipped_combos=0
+    local skipped_entries=0
+
+    for entry in "${TEST_MATRIX_ENTRIES[@]}"; do
+        local phase scenario runner_enabled scenario_disabled profiles_csv prereqs_csv
+        IFS=$'\t' read -r phase scenario runner_enabled scenario_disabled profiles_csv prereqs_csv <<< "$entry"
+
+        IFS=',' read -r -a profiles <<< "$profiles_csv"
+        local remaining=()
+        for profile in "${profiles[@]}"; do
+            local key="${scenario}|${profile}"
+            local done=${completed_counts[$key]:-0}
+            if [[ "$done" -ge "$RUNS_PER_SCENARIO" ]]; then
+                skipped_combos=$(( skipped_combos + 1 ))
+            else
+                remaining+=("$profile")
+            fi
+        done
+
+        if [[ ${#remaining[@]} -eq 0 ]]; then
+            skipped_entries=$(( skipped_entries + 1 ))
+            continue
+        fi
+
+        # Rebuild entry with only the remaining profiles
+        local new_profiles_csv
+        new_profiles_csv=$(IFS=','; echo "${remaining[*]}")
+        filtered+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s' \
+            "$phase" "$scenario" "$runner_enabled" "$scenario_disabled" \
+            "$new_profiles_csv" "$prereqs_csv")")
+    done
+
+    TEST_MATRIX_ENTRIES=("${filtered[@]}")
+
+    # Recount progress total
+    PROGRESS_TOTAL=0
+    for entry in "${TEST_MATRIX_ENTRIES[@]}"; do
+        local _phase _scenario _runner_enabled _scenario_disabled _profiles_csv _prereqs_csv
+        IFS=$'\t' read -r _phase _scenario _runner_enabled _scenario_disabled _profiles_csv _prereqs_csv <<< "$entry"
+        local _skip
+        _skip=$(entry_skip_reason "$_phase" "$_scenario" "$_runner_enabled" "$_scenario_disabled" "$_prereqs_csv" || true)
+        if [[ -z "$_skip" ]] && phase_enabled "$_phase"; then
+            IFS=',' read -r -a _profiles <<< "$_profiles_csv"
+            PROGRESS_TOTAL=$(( PROGRESS_TOTAL + ${#_profiles[@]} ))
+        fi
+    done
+
+    if [[ "$skipped_combos" -gt 0 ]]; then
+        log_info "Resume: $skipped_combos scenario/profile combos already completed, $skipped_entries entries fully done"
+        log_info "Resume: ${#TEST_MATRIX_ENTRIES[@]} entries remaining (from $original_count)"
+    fi
+}
+
 # Check sudo access for tc
 check_sudo() {
     log_info "Checking sudo access for network emulation..."
@@ -437,6 +536,9 @@ prereq_satisfied() {
         http://localhost:8000/v1/models)
             [[ "$HAS_VLLM" == "true" ]]
             ;;
+        cmd:*)
+            command -v "${prereq#cmd:}" > /dev/null 2>&1
+            ;;
         http://*|https://*)
             curl -sf "$prereq" > /dev/null 2>&1
             ;;
@@ -491,7 +593,10 @@ entry_skip_reason() {
     return 1
 }
 
-# Run a single scenario with all its profiles
+# Run a single scenario with all its profiles.
+# Sets LAST_SCENARIO_DID_WORK=true if any profile actually ran tests.
+LAST_SCENARIO_DID_WORK=false
+
 run_scenario() {
     local scenario=$1
     shift
@@ -502,6 +607,7 @@ run_scenario() {
     local logfile=""
     local exit_code=0
     local failure_detail=""
+    local scenario_did_work=false
 
     if [[ "$NETWORK_INTERFACE" == "auto" ]]; then
         interface_override=$(get_scenario_config_value "$scenario" "network_interface" || true)
@@ -529,12 +635,22 @@ run_scenario() {
             --scenario $scenario \
             --profile $profile \
             --runs $RUNS_PER_SCENARIO \
-            --interface $scenario_interface"
+            --interface $scenario_interface \
+            --mcp-transport $MCP_TRANSPORT"
 
         if [[ "$CAPTURE_PCAP" == "true" ]]; then
             cmd="$cmd --capture-pcap --capture-dir $CAPTURE_DIR"
             if [[ -n "$CAPTURE_FILTER" ]]; then
                 cmd="$cmd --capture-filter '$CAPTURE_FILTER'"
+            fi
+            # Secondary loopback capture so MCP JSON-RPC frames (which traverse
+            # http://127.0.0.1 between agent and MCP server) are visible in pcap.
+            # Skipped automatically by orchestrator.py when the primary
+            # interface is already lo or when --mcp-transport=stdio.
+            if [[ "$CAPTURE_LOOPBACK" == "true" ]]; then
+                cmd="$cmd --capture-loopback"
+            else
+                cmd="$cmd --no-capture-loopback"
             fi
         fi
 
@@ -570,9 +686,17 @@ run_scenario() {
             return 1
         fi
 
+        # Skip cooldown if the orchestrator skipped all runs (resume mode)
+        if grep -q "all .* runs already completed" "$logfile" 2>/dev/null; then
+            continue
+        fi
+
+        scenario_did_work=true
         log_info "Cooling down for ${INTER_SCENARIO_DELAY}s..."
         sleep "$INTER_SCENARIO_DELAY"
     done
+
+    LAST_SCENARIO_DID_WORK="$scenario_did_work"
 }
 
 run_test_matrix_suite() {
@@ -629,7 +753,9 @@ run_test_matrix_suite() {
             log_error "Stopping: $scenario failed (use --resume to continue later)"
             return 1
         fi
-        phase_ran=true
+        if [[ "$LAST_SCENARIO_DID_WORK" == "true" ]]; then
+            phase_ran=true
+        fi
     done
 }
 
@@ -711,6 +837,15 @@ main() {
     fi
     load_test_matrix
 
+    # In resume mode, filter out completed work before doing anything else
+    if [[ "$RESUME_MODE" == "true" ]]; then
+        filter_completed_from_matrix
+        if [[ ${#TEST_MATRIX_ENTRIES[@]} -eq 0 ]]; then
+            log_info "All scenario/profile combos already completed — nothing to do."
+            exit 0
+        fi
+    fi
+
     mkdir -p logs
     trap cleanup_on_exit EXIT INT TERM
 
@@ -732,16 +867,18 @@ main() {
     START_TIME=$(date +%s)
 
     # =====================================================
-    # Network Profiles referenced by configs/scenarios.yaml:test_matrix:
-    # - no_emulation: reference case with no tc/netem impairment
-    # - ideal_6g:   1ms delay, 0% loss, unlimited BW (baseline)
-    # - 5g_urban:   20ms delay, 0.1% loss, 100Mbit
-    # - wifi_good:  30ms delay, 0.1% loss, 50Mbit
-    # - cell_edge:  120ms delay, 1% loss, 5Mbit
-    # - satellite:  600ms delay, 0.5% loss, 10Mbit
-    # - congested:  200ms delay, 3% loss, 1Mbit
-    # - 5qi_7:      100ms delay, 0.1% loss (Voice/Live Streaming)
-    # - 5qi_80:     10ms delay, 0.0001% loss (Low-latency eMBB/AR)
+    # Network Profiles referenced by configs/scenarios.yaml:test_matrix
+    # (per S4-260848 Table C.Z-1):
+    # - no_emulation:   reference case with no tc/netem impairment
+    # - 6g_itu_hrllc:   1ms / 0.001% loss / 300Mbit (ITU IMT-2030 HRLLC)
+    # - 5g_urban:       20ms / 0.1% loss / 100Mbit (mainstream cellular)
+    # - wifi_good:      30ms / 0.1% loss / 50Mbit (non-3GPP local access)
+    # - cell_edge:      120ms / 1% loss / 5Mbit (paretonormal jitter, gemodel loss)
+    # - satellite_leo:  ASYMMETRIC — DL 22ms/100Mbit, UL 22ms/15Mbit
+    # - satellite_geo:  ASYMMETRIC — DL 340ms/50Mbit, UL 340ms/3Mbit
+    # - congested:      200ms / 3% loss / 1Mbit (bufferbloat / queue stress)
+    # - 5qi_7:          80ms / 0.1% loss (Voice / Live Streaming, jitter-corrected PDB)
+    # - 5qi_80:         8ms / 0.0001% loss (Low-latency eMBB / AR)
     # =====================================================
 
     if ! run_test_matrix_suite; then
@@ -1087,7 +1224,7 @@ while [[ $# -gt 0 ]]; do
             echo "  ANONYMIZE_DB             Anonymize provider/model names (default: true)"
             echo "  CLEAN_START              Archive old data before starting (default: true)"
             echo "  NETWORK_INTERFACE        Global interface override (default: auto)"
-            echo "  RUN_TIMEOUT_SEC          Per-run timeout in seconds (default: 600, 0 = no timeout)"
+            echo "  RUN_TIMEOUT_SEC          Per-run timeout in seconds (default: 300, 0 = no timeout)"
             echo ""
             echo "Optional API keys (for additional scenarios):"
             echo "  GOOGLE_SEARCH_API_KEY    Enable Google search scenarios"

@@ -13,6 +13,7 @@ try:
     from .pcap_analyzer import (
         PcapAnalyzer,
         PcapMetrics,
+        PacketRecord,
         TCPFlow,
         analyze_pcap,
         analyze_multiple_pcaps,
@@ -23,6 +24,7 @@ except ImportError:
     HAS_PCAP_ANALYZER = False
     PcapAnalyzer = None
     PcapMetrics = None
+    PacketRecord = None
     TCPFlow = None
     analyze_pcap = None
     analyze_multiple_pcaps = None
