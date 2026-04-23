@@ -194,6 +194,37 @@ class PcapMetrics:
     # Per-flow data
     flows: list[TCPFlow] = field(default_factory=list)
 
+    # ---------------------------------------------------------------------
+    # Per-direction / multi-window metrics (S4-260859 Q1.3, Q1.4, Q2.1..2.3)
+    # Populated by _compute_per_direction_and_multi_window() after parsing.
+    # ---------------------------------------------------------------------
+
+    # Per-direction packet counts and byte totals (aggregated across all TCP flows)
+    ul_packets: int = 0
+    dl_packets: int = 0
+    ul_bytes_total: int = 0
+    dl_bytes_total: int = 0
+    ul_mean_pkt_size: Optional[float] = None
+    dl_mean_pkt_size: Optional[float] = None
+
+    # Multi-window per-direction throughput — each entry keyed by window label
+    # ("1ms", "10ms", "100ms", "1s", "10s"), value = list of
+    # (rel_time_sec, ul_bps, dl_bps). peak_mbps_by_window is peak (UL+DL) per window.
+    throughput_by_window: dict = field(default_factory=dict)
+    peak_mbps_by_window: dict = field(default_factory=dict)
+
+    # Burstiness = peak / mean of (UL+DL) across buckets, per window (Q2.3).
+    burstiness_by_window: dict = field(default_factory=dict)
+
+    # Per-direction bursts, keyed by gap-threshold label ("10ms", "100ms"):
+    #   { "10ms": { "ul": [burst, ...], "dl": [burst, ...] }, "100ms": {...} }
+    # Each burst: {start, end, duration_sec, total_bytes, packet_count, peak_rate_bps}
+    bursts_by_gap: dict = field(default_factory=dict)
+
+    # Inter-burst idle-gap durations per direction, keyed same as bursts_by_gap.
+    # { "10ms": { "ul": [gap_sec, ...], "dl": [gap_sec, ...] } }  (Q2.2, Q4.5)
+    interburst_idle_by_gap: dict = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -403,7 +434,152 @@ class PcapAnalyzer:
 
             metrics.peak_throughput_mbps = peak_throughput / 1000
 
+        # Per-direction + multi-window + burst metrics (S4-260859 Q1.3, Q1.4, Q2.1..2.3)
+        self._compute_per_direction_and_multi_window(
+            metrics, first_ts=first_ts
+        )
+
         return metrics
+
+    @staticmethod
+    def _compute_per_direction_and_multi_window(
+        metrics: PcapMetrics,
+        first_ts: Optional[float] = None,
+        windows_sec: tuple = (0.001, 0.01, 0.1, 1.0, 10.0),
+        burst_gaps_sec: tuple = (0.010, 0.100),
+    ) -> None:
+        """Populate per-direction counts, multi-window throughput, burstiness,
+        and per-direction burst segmentation at configurable gap thresholds.
+
+        All derived data comes from ``metrics.packets`` (per-packet records
+        captured during the main analyze() loop)."""
+        pkts = metrics.packets
+        if not pkts:
+            return
+
+        # ---- Per-direction totals (Q1.3) ----
+        ul_count = dl_count = 0
+        ul_bytes = dl_bytes = 0
+        for p in pkts:
+            if p.direction == "ul":
+                ul_count += 1
+                ul_bytes += p.size
+            elif p.direction == "dl":
+                dl_count += 1
+                dl_bytes += p.size
+        metrics.ul_packets = ul_count
+        metrics.dl_packets = dl_count
+        metrics.ul_bytes_total = ul_bytes
+        metrics.dl_bytes_total = dl_bytes
+        metrics.ul_mean_pkt_size = ul_bytes / ul_count if ul_count else None
+        metrics.dl_mean_pkt_size = dl_bytes / dl_count if dl_count else None
+
+        # Reference start for relative timing
+        t0 = first_ts if first_ts is not None else pkts[0].timestamp
+
+        # ---- Multi-window per-direction throughput + burstiness (Q1.4, Q2.3) ----
+        label_for = {
+            0.001: "1ms", 0.01: "10ms", 0.1: "100ms", 1.0: "1s", 10.0: "10s",
+        }
+        for win in windows_sec:
+            label = label_for.get(win, f"{win:g}s")
+            buckets: dict[int, dict] = defaultdict(lambda: {"ul": 0, "dl": 0})
+            for p in pkts:
+                bkt = int((p.timestamp - t0) / win) if win > 0 else 0
+                if p.direction == "ul":
+                    buckets[bkt]["ul"] += p.size
+                elif p.direction == "dl":
+                    buckets[bkt]["dl"] += p.size
+            if not buckets:
+                continue
+            series: list[tuple[float, float, float]] = []
+            for bkt in sorted(buckets):
+                b = buckets[bkt]
+                # bits per second within this window
+                ul_bps = (b["ul"] * 8) / win
+                dl_bps = (b["dl"] * 8) / win
+                series.append((bkt * win, ul_bps, dl_bps))
+            metrics.throughput_by_window[label] = series
+            totals = [ul + dl for _, ul, dl in series]
+            if totals:
+                peak = max(totals)
+                mean = sum(totals) / len(totals)
+                metrics.peak_mbps_by_window[label] = peak / 1_000_000
+                metrics.burstiness_by_window[label] = (peak / mean) if mean > 0 else 0.0
+
+        # ---- Per-direction burst segmentation + inter-burst idle gaps (Q2.1, Q2.2, Q4.5) ----
+        # Split packets by direction, sort, then segment on idle gaps.
+        by_dir: dict[str, list] = {"ul": [], "dl": []}
+        for p in pkts:
+            if p.direction in by_dir:
+                by_dir[p.direction].append(p)
+        for d in by_dir.values():
+            d.sort(key=lambda x: x.timestamp)
+
+        gap_label = {0.010: "10ms", 0.100: "100ms"}
+        for gap_sec in burst_gaps_sec:
+            label = gap_label.get(gap_sec, f"{int(gap_sec*1000)}ms")
+            per_dir_bursts: dict[str, list] = {"ul": [], "dl": []}
+            per_dir_idle: dict[str, list] = {"ul": [], "dl": []}
+            for direction, packets in by_dir.items():
+                if not packets:
+                    continue
+                bursts = []
+                cur = {
+                    "start": packets[0].timestamp,
+                    "end": packets[0].timestamp,
+                    "total_bytes": packets[0].size,
+                    "packet_count": 1,
+                    "max_iat": 0.0,
+                }
+                last_ts = packets[0].timestamp
+                for p in packets[1:]:
+                    iat = p.timestamp - last_ts
+                    if iat > gap_sec:
+                        # End current burst, record idle gap, start a new one
+                        dur = cur["end"] - cur["start"]
+                        peak_rate_bps = (
+                            (cur["total_bytes"] * 8) / dur if dur > 0 else
+                            (cur["total_bytes"] * 8) / gap_sec
+                        )
+                        bursts.append({
+                            "start": cur["start"],
+                            "end": cur["end"],
+                            "duration_sec": dur,
+                            "total_bytes": cur["total_bytes"],
+                            "packet_count": cur["packet_count"],
+                            "peak_rate_bps": peak_rate_bps,
+                        })
+                        per_dir_idle[direction].append(iat)
+                        cur = {
+                            "start": p.timestamp,
+                            "end": p.timestamp,
+                            "total_bytes": p.size,
+                            "packet_count": 1,
+                            "max_iat": 0.0,
+                        }
+                    else:
+                        cur["end"] = p.timestamp
+                        cur["total_bytes"] += p.size
+                        cur["packet_count"] += 1
+                    last_ts = p.timestamp
+                # Close out final burst
+                dur = cur["end"] - cur["start"]
+                peak_rate_bps = (
+                    (cur["total_bytes"] * 8) / dur if dur > 0 else
+                    (cur["total_bytes"] * 8) / gap_sec
+                )
+                bursts.append({
+                    "start": cur["start"],
+                    "end": cur["end"],
+                    "duration_sec": dur,
+                    "total_bytes": cur["total_bytes"],
+                    "packet_count": cur["packet_count"],
+                    "peak_rate_bps": peak_rate_bps,
+                })
+                per_dir_bursts[direction] = bursts
+            metrics.bursts_by_gap[label] = per_dir_bursts
+            metrics.interburst_idle_by_gap[label] = per_dir_idle
 
     def _process_tcp_packet(
         self,

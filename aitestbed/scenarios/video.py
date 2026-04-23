@@ -46,6 +46,7 @@ class VideoUnderstandingScenario(BaseScenario):
             return result
 
         for turn_index, prompt in enumerate(prompts):
+            self._wait_between_prompts(turn_index)
             source = video_sources[min(turn_index, len(video_sources) - 1)]
             video_url = source.get("video_url")
             video_path = source.get("video_path")

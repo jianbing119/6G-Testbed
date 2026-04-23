@@ -41,6 +41,14 @@ except ImportError:
     analyze_multiple_pcaps = None
     merge_pcap_metrics = None
 
+# RAN2 methodology metrics (S4-260859)
+try:
+    from analysis.ran2_metrics import compute_ran2_metrics
+    HAS_RAN2 = True
+except ImportError:
+    HAS_RAN2 = False
+    compute_ran2_metrics = None
+
 ANONYMIZER = get_anonymizer()
 
 def load_data_from_db(db_path: str = "logs/traffic_logs.db", since_timestamp: float = None) -> list[dict]:
@@ -2914,6 +2922,442 @@ def generate_pcap_summary_chart(pcap_metrics: list, output_dir: Path) -> str:
     return str(output_path)
 
 
+# =============================================================================
+# RAN2 methodology charts (S4-260859 Annex D)
+# =============================================================================
+#
+# Each function consumes the nested dict returned by
+# analysis.ran2_metrics.compute_ran2_metrics(). Charts degrade gracefully to
+# an empty-image / None when input data is missing.
+
+_WINDOW_ORDER = ["1ms", "10ms", "100ms", "1s", "10s"]
+
+
+def _fmt_scenario(s: str) -> str:
+    return ANONYMIZER.scenario_alias(s) or s
+
+
+def generate_ran2_per_direction_packets_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q1.3 — UL vs DL packet counts + mean packet sizes per pcap."""
+    rows = ran2.get("Q1", {}).get("pcap_per_direction") or []
+    if not rows:
+        return None
+    labels = [Path(r["pcap_file"]).name[:28] for r in rows]
+    ul_pkts = [r.get("ul_packets", 0) for r in rows]
+    dl_pkts = [r.get("dl_packets", 0) for r in rows]
+    ul_size = [r.get("ul_mean_pkt_size") or 0 for r in rows]
+    dl_size = [r.get("dl_mean_pkt_size") or 0 for r in rows]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6))
+    x = range(len(labels))
+    width = 0.38
+    ax1.bar([i - width/2 for i in x], ul_pkts, width, label="UL", color="#1f77b4")
+    ax1.bar([i + width/2 for i in x], dl_pkts, width, label="DL", color="#ff7f0e")
+    ax1.set_xticks(list(x)); ax1.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax1.set_ylabel("Packet count"); ax1.set_title("Q1.3 — Per-direction packet count (per pcap)")
+    ax1.legend(); ax1.grid(axis="y", alpha=0.3)
+
+    ax2.bar([i - width/2 for i in x], ul_size, width, label="UL", color="#1f77b4")
+    ax2.bar([i + width/2 for i in x], dl_size, width, label="DL", color="#ff7f0e")
+    ax2.set_xticks(list(x)); ax2.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax2.set_ylabel("Mean packet size (bytes)")
+    ax2.set_title("Q1.3 — Per-direction mean packet size")
+    ax2.legend(); ax2.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    out = output_dir / "ran2_q1_per_direction_packets.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_multiwindow_throughput_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q1.4 — peak Mbps per window (1/10/100ms/1s/10s), per pcap."""
+    rows = ran2.get("Q1", {}).get("pcap_per_direction") or []
+    if not rows:
+        return None
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    x = list(range(len(_WINDOW_ORDER)))
+    for r in rows:
+        peaks = r.get("peak_mbps_by_window") or {}
+        y = [peaks.get(w, 0) for w in _WINDOW_ORDER]
+        ax.plot(x, y, marker="o", label=Path(r["pcap_file"]).name[:32])
+    ax.set_xticks(x); ax.set_xticklabels(_WINDOW_ORDER)
+    ax.set_xlabel("Averaging window")
+    ax.set_ylabel("Peak throughput (Mbps)")
+    ax.set_title("Q1.4 — Per-direction peak throughput across 1ms…10s windows\n"
+                 "Short windows reveal sub-second bursts; long windows show sustained rate")
+    ax.set_yscale("log")
+    ax.legend(loc="best", fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "ran2_q1_multiwindow_throughput.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_burstiness_by_window_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q2.3 — peak/mean burstiness index at 1ms/10ms/100ms/1s/10s windows."""
+    rows = ran2.get("Q2", {}).get("per_pcap") or []
+    if not rows:
+        return None
+    fig, ax = plt.subplots(figsize=(14, 6))
+    x = list(range(len(_WINDOW_ORDER)))
+    for r in rows:
+        vals = r.get("burstiness_by_window") or {}
+        y = [vals.get(w) or 0 for w in _WINDOW_ORDER]
+        ax.plot(x, y, marker="s", label=Path(r["pcap_file"]).name[:32])
+    ax.set_xticks(x); ax.set_xticklabels(_WINDOW_ORDER)
+    ax.set_xlabel("Averaging window")
+    ax.set_ylabel("Burstiness index (peak / mean)")
+    ax.set_title("Q2.3 — Burstiness across averaging windows\n"
+                 "Higher at short windows = bursty; flat curve = smooth")
+    ax.legend(loc="best", fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+    # Annotate OS-scheduler-jitter caveat for <10ms
+    ax.axvspan(-0.4, 0.4, alpha=0.15, color="red")
+    ax.text(0, ax.get_ylim()[1] * 0.95,
+            "OS jitter region", ha="center", fontsize=8, color="darkred")
+    plt.tight_layout()
+    out = output_dir / "ran2_q2_burstiness_by_window.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_interburst_idle_cdf_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q2.2 / Q4.5 — inter-burst idle-gap CDF per direction at 10ms + 100ms gap."""
+    # Reach into the raw pcap_metrics? No — ran2_metrics emits distributions.
+    # We draw one bar group per (gap, direction) showing p50/p95/p99 of idle gaps.
+    rows = ran2.get("Q2", {}).get("per_pcap") or []
+    if not rows:
+        return None
+
+    categories: list[str] = []
+    p50: list[float] = []
+    p95: list[float] = []
+    p99: list[float] = []
+    for r in rows:
+        name = Path(r["pcap_file"]).name[:20]
+        for gap in ("10ms", "100ms"):
+            for direction in ("ul", "dl"):
+                d = (((r.get("interburst_idle_by_gap") or {}).get(gap) or {}).get(direction) or {}).get("cdf_sec") or {}
+                if d.get("n"):
+                    categories.append(f"{name}\n{direction.upper()}@{gap}")
+                    p50.append((d.get("p50") or 0) * 1000)
+                    p95.append((d.get("p95") or 0) * 1000)
+                    p99.append((d.get("p99") or 0) * 1000)
+    if not categories:
+        return None
+
+    x = range(len(categories))
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(max(14, len(categories) * 0.8), 6))
+    ax.bar([i - width for i in x], p50, width, label="p50", color="#4daf4a")
+    ax.bar(list(x), p95, width, label="p95", color="#ff7f00")
+    ax.bar([i + width for i in x], p99, width, label="p99", color="#e41a1c")
+    ax.set_xticks(list(x)); ax.set_xticklabels(categories, rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel("Inter-burst idle gap (ms)")
+    ax.set_yscale("log")
+    ax.set_title("Q2.2 / Q4.5 — Inter-burst idle-gap distribution (per direction, gap threshold)")
+    ax.legend(); ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "ran2_q2_interburst_idle_cdf.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_rtt_components_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q3.1/Q3.2 — TCP handshake RTT vs TLS handshake vs HTTP setup RTT distributions."""
+    q3 = ran2.get("Q3") or {}
+    items = [
+        ("TCP handshake RTT", q3.get("tcp_rtt") or {}),
+        ("TLS handshake", q3.get("tls_handshake") or {}),
+        ("HTTP setup RTT", q3.get("http_setup_rtt") or {}),
+    ]
+    items = [(name, d) for name, d in items if d.get("n")]
+    if not items:
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = range(len(items))
+    width = 0.22
+    mins = [d.get("min") or 0 for _, d in items]
+    p50s = [d.get("p50") or 0 for _, d in items]
+    p95s = [d.get("p95") or 0 for _, d in items]
+    maxs = [d.get("max") or 0 for _, d in items]
+    ax.bar([i - 1.5*width for i in x], mins, width, label="min", color="#4daf4a")
+    ax.bar([i - 0.5*width for i in x], p50s, width, label="p50", color="#377eb8")
+    ax.bar([i + 0.5*width for i in x], p95s, width, label="p95", color="#ff7f00")
+    ax.bar([i + 1.5*width for i in x], maxs, width, label="max", color="#e41a1c")
+    ax.set_xticks(list(x)); ax.set_xticklabels([n for n, _ in items])
+    ax.set_ylabel("Duration (ms)")
+    ax.set_title("Q3.1 / Q3.2 — RTT components")
+    ax.legend(); ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "ran2_q3_rtt_components.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_e2e_latency_over_rtt_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q3.4 — (E2E latency / TCP RTT) per scenario/profile."""
+    data = ran2.get("Q3", {}).get("e2e_latency_vs_rtt") or {}
+    if not data:
+        return None
+
+    labels = sorted(data.keys())
+    ratios = [(data[k].get("p50") or 0) for k in labels]
+    fig, ax = plt.subplots(figsize=(max(12, len(labels) * 0.55), 6))
+    ax.bar(range(len(labels)), ratios, color="#984ea3")
+    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=75, ha="right", fontsize=8)
+    ax.set_ylabel("E2E latency / RTT p50 (x)")
+    ax.set_title("Q3.4 — End-to-end latency as a multiple of TCP RTT (non-streaming)")
+    ax.axhline(1.0, color="black", linestyle="--", alpha=0.4, label="1× RTT")
+    ax.legend(); ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "ran2_q3_e2e_latency_over_rtt.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_reliability_vs_loss_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q4.4 — success rate vs nominal profile loss_pct (one dot per scenario/profile)."""
+    data = ran2.get("Q4", {}).get("reliability_by_loss_pct") or {}
+    if not data:
+        return None
+
+    xs, ys, labels = [], [], []
+    for key, v in data.items():
+        lp = v.get("profile_loss_pct")
+        sr = v.get("success_rate")
+        if lp is None or sr is None:
+            continue
+        xs.append(lp)
+        ys.append(sr * 100.0)
+        labels.append(key)
+    if not xs:
+        return None
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+    ax.scatter(xs, ys, s=60, alpha=0.7, edgecolors="black")
+    for lx, ly, ll in zip(xs, ys, labels):
+        ax.annotate(ll, (lx, ly), xytext=(4, 4), textcoords="offset points", fontsize=6)
+    ax.set_xlabel("Nominal profile loss (%)")
+    ax.set_ylabel("Observed success rate (%)")
+    ax.set_xscale("symlog", linthresh=0.001)
+    ax.set_title("Q4.4 — Reliability of service vs netem loss rate")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "ran2_q4_reliability_vs_loss.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_flow_duration_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q4.6 — flow-duration distribution + connection-reuse ratio + flows-per-pcap."""
+    cd = ran2.get("Q4", {}).get("connection_duration") or {}
+    fd = cd.get("flow_duration_sec") or {}
+    if not fd.get("n"):
+        return None
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    labels = ["min", "p50", "p95", "p99", "max"]
+    vals = [fd.get(k) or 0 for k in labels]
+    ax1.bar(labels, vals, color="#2ca02c")
+    ax1.set_ylabel("Flow duration (s)")
+    ax1.set_yscale("log")
+    ax1.set_title("Q4.6 — TCP flow duration distribution")
+    ax1.grid(axis="y", alpha=0.3)
+    for l, v in zip(labels, vals):
+        ax1.text(l, v * 1.05, f"{v:.2f}", ha="center", fontsize=8)
+
+    reuse = cd.get("connection_reuse_ratio")
+    flows_per = cd.get("flows_per_pcap") or {}
+    ax2.axis("off")
+    lines = [
+        f"Connection-reuse ratio: {reuse:.1%}" if reuse is not None else "Connection-reuse ratio: —",
+        "",
+        "Flows per pcap:",
+        f"  min = {flows_per.get('min') or 0:.0f}",
+        f"  p50 = {flows_per.get('p50') or 0:.0f}",
+        f"  p95 = {flows_per.get('p95') or 0:.0f}",
+        f"  max = {flows_per.get('max') or 0:.0f}",
+        "",
+        "High reuse = HTTP/2 or keep-alive.",
+        "Low reuse = new connection per turn.",
+    ]
+    ax2.text(0.02, 0.95, "\n".join(lines), transform=ax2.transAxes,
+             fontsize=11, va="top", family="monospace",
+             bbox=dict(boxstyle="round", facecolor="#f5f5f5"))
+    plt.tight_layout()
+    out = output_dir / "ran2_q4_flow_duration.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_per_tool_bytes_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q4.7 — per-tool request+response bytes (agentic scenarios)."""
+    tools = (ran2.get("Q4", {}).get("agentic_flows") or {}).get("per_tool_bytes") or {}
+    if not tools:
+        return None
+    # Sort by total bytes desc
+    items = sorted(tools.items(), key=lambda kv: kv[1].get("request_bytes", 0) + kv[1].get("response_bytes", 0), reverse=True)
+    items = items[:25]  # top 25
+    names = [k for k, _ in items]
+    req = [v.get("request_bytes", 0) for _, v in items]
+    resp = [v.get("response_bytes", 0) for _, v in items]
+
+    fig, ax = plt.subplots(figsize=(12, max(5, len(names) * 0.28)))
+    y = range(len(names))
+    ax.barh(y, req, color="#1f77b4", label="Request bytes")
+    ax.barh(y, resp, left=req, color="#ff7f0e", label="Response bytes")
+    ax.set_yticks(list(y)); ax.set_yticklabels(names, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Bytes")
+    ax.set_xscale("log")
+    ax.set_title("Q4.7 — Per-tool sub-flow volume (top 25 tools, request + response)")
+    ax.legend(); ax.grid(axis="x", alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "ran2_q4_per_tool_bytes.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_inter_token_gap_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q5.4 — inter-token gap distribution per network profile."""
+    data = ran2.get("Q5", {}).get("inter_token_gap_by_profile") or {}
+    if not data:
+        return None
+
+    profiles = sorted(data.keys())
+    p50 = [(data[p].get("p50") or 0) * 1000 for p in profiles]
+    p95 = [(data[p].get("p95") or 0) * 1000 for p in profiles]
+    p99 = [(data[p].get("p99") or 0) * 1000 for p in profiles]
+
+    x = range(len(profiles))
+    width = 0.27
+    fig, ax = plt.subplots(figsize=(max(11, len(profiles) * 0.9), 6))
+    ax.bar([i - width for i in x], p50, width, label="p50", color="#4daf4a")
+    ax.bar(list(x), p95, width, label="p95", color="#ff7f00")
+    ax.bar([i + width for i in x], p99, width, label="p99", color="#e41a1c")
+    ax.set_xticks(list(x)); ax.set_xticklabels(profiles, rotation=30, ha="right")
+    ax.set_ylabel("Inter-token gap (ms)")
+    ax.set_yscale("log")
+    ax.set_title("Q5.4 — Inter-token gap distribution per network profile")
+    ax.legend(); ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "ran2_q5_inter_token_gap.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_tokens_to_bytes_regression_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q5.5 — slope (bytes per token) per scenario, UL vs DL, with r²."""
+    data = ran2.get("Q5", {}).get("token_to_bytes_regression_by_scenario") or {}
+    if not data:
+        return None
+
+    scenarios: list[str] = []
+    ul_slopes: list[float] = []
+    dl_slopes: list[float] = []
+    ul_r2s: list[float] = []
+    dl_r2s: list[float] = []
+    for s, r in data.items():
+        ul = r.get("ul") or {}
+        dl = r.get("dl") or {}
+        if not ul and not dl:
+            continue
+        scenarios.append(_fmt_scenario(s))
+        ul_slopes.append(ul.get("slope") or 0)
+        dl_slopes.append(dl.get("slope") or 0)
+        ul_r2s.append(ul.get("r2") or 0)
+        dl_r2s.append(dl.get("r2") or 0)
+    if not scenarios:
+        return None
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, max(5, len(scenarios) * 0.3)))
+    y = range(len(scenarios))
+    ax1.barh(y, ul_slopes, color="#1f77b4", label="UL slope (bytes/token_in)")
+    ax1.barh(y, dl_slopes, color="#ff7f0e", alpha=0.6, label="DL slope (bytes/token_out)")
+    ax1.set_yticks(list(y)); ax1.set_yticklabels(scenarios, fontsize=8)
+    ax1.invert_yaxis()
+    ax1.set_xlabel("Bytes per token (regression slope)")
+    ax1.set_title("Q5.5 — tokens→bytes regression slope per scenario")
+    ax1.legend(); ax1.grid(axis="x", alpha=0.3)
+
+    # r² chart
+    width = 0.4
+    ax2.barh([i - width/2 for i in y], ul_r2s, width, label="UL r²", color="#1f77b4")
+    ax2.barh([i + width/2 for i in y], dl_r2s, width, label="DL r²", color="#ff7f0e")
+    ax2.set_yticks(list(y)); ax2.set_yticklabels(scenarios, fontsize=8)
+    ax2.invert_yaxis()
+    ax2.set_xlabel("Coefficient of determination r² (0 → 1)")
+    ax2.set_xlim(0, 1.05)
+    ax2.axvline(0.8, color="green", linestyle="--", alpha=0.5, label="0.8 (good fit)")
+    ax2.set_title("Q5.5 — Regression quality (r²)")
+    ax2.legend(); ax2.grid(axis="x", alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "ran2_q5_tokens_to_bytes_regression.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def generate_ran2_token_vs_pkt_rate_chart(ran2: dict, output_dir: Path) -> Optional[str]:
+    """Q5.3 — token-arrival rate (per profile) vs DL-packet-arrival rate (from pcap)."""
+    q5 = ran2.get("Q5", {}).get("token_arrival_vs_pkt_arrival") or {}
+    tok_rate = q5.get("token_rate_per_profile_hz") or {}
+    dl_rate_dist = q5.get("dl_pkt_rate_hz") or {}
+    if not tok_rate and not dl_rate_dist.get("n"):
+        return None
+
+    profiles = sorted(tok_rate.keys())
+    trates = [tok_rate[p] or 0 for p in profiles]
+    dl_med = dl_rate_dist.get("p50") or 0
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x = range(len(profiles))
+    ax.bar(x, trates, label="Token arrival rate (Hz, per profile)", color="#1f77b4")
+    if dl_med > 0:
+        ax.axhline(dl_med, color="#d62728", linestyle="--",
+                   label=f"DL packet arrival rate p50 = {dl_med:.1f} Hz")
+    ax.set_xticks(list(x)); ax.set_xticklabels(profiles, rotation=30, ha="right")
+    ax.set_ylabel("Arrival rate (Hz)")
+    ax.set_title("Q5.3 — Token arrival rate vs DL packet arrival rate")
+    ax.legend(); ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "ran2_q5_token_vs_pkt_rate.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+    return str(out)
+
+
+def _generate_all_ran2_charts(ran2: dict, output_dir: Path) -> dict:
+    """Dispatcher — run all RAN2 chart generators, return {key: path}."""
+    generators = [
+        ("ran2_q1_per_direction_packets", generate_ran2_per_direction_packets_chart),
+        ("ran2_q1_multiwindow_throughput", generate_ran2_multiwindow_throughput_chart),
+        ("ran2_q2_burstiness_by_window", generate_ran2_burstiness_by_window_chart),
+        ("ran2_q2_interburst_idle_cdf", generate_ran2_interburst_idle_cdf_chart),
+        ("ran2_q3_rtt_components", generate_ran2_rtt_components_chart),
+        ("ran2_q3_e2e_latency_over_rtt", generate_ran2_e2e_latency_over_rtt_chart),
+        ("ran2_q4_reliability_vs_loss", generate_ran2_reliability_vs_loss_chart),
+        ("ran2_q4_flow_duration", generate_ran2_flow_duration_chart),
+        ("ran2_q4_per_tool_bytes", generate_ran2_per_tool_bytes_chart),
+        ("ran2_q5_inter_token_gap", generate_ran2_inter_token_gap_chart),
+        ("ran2_q5_tokens_to_bytes_regression", generate_ran2_tokens_to_bytes_regression_chart),
+        ("ran2_q5_token_vs_pkt_rate", generate_ran2_token_vs_pkt_rate_chart),
+    ]
+    out: dict[str, str] = {}
+    for key, fn in generators:
+        try:
+            path = fn(ran2, output_dir)
+            if path:
+                out[key] = path
+                print(f"  ✓ RAN2 {key}: {path}")
+        except Exception as e:
+            print(f"  ⚠ RAN2 chart {key} failed: {e}")
+    return out
+
+
 def main():
     """Generate all charts and print results."""
     parser = argparse.ArgumentParser(description="Generate visualization charts from traffic test data")
@@ -3189,6 +3633,31 @@ def main():
         else:
             print(f"\n⚠ Pcap analysis requested but dpkt not installed.")
             print("  Install with: pip install dpkt")
+
+    # =================================================================
+    # RAN2 methodology metrics + charts (S4-260859 Annex D)
+    # Runs regardless of pcap: DB-only metrics still emit; pcap-backed
+    # metrics degrade to n=0 if no pcap data was captured.
+    # =================================================================
+    if HAS_RAN2:
+        print("\nComputing RAN2 methodology metrics (S4-260859)...")
+        try:
+            ran2 = compute_ran2_metrics(
+                records=records,
+                pcap_metrics=pcap_metrics or [],
+                profiles_yaml="configs/profiles.yaml",
+            )
+            # Persist the full dict so the report generator can pick it up
+            ran2_path = output_dir / "ran2_metrics.json"
+            with open(ran2_path, "w") as f:
+                json.dump(ran2, f, indent=2, default=str)
+            print(f"  ✓ RAN2 metrics JSON: {ran2_path}")
+
+            print("Generating RAN2 methodology charts...")
+            ran2_charts = _generate_all_ran2_charts(ran2, output_dir)
+            generated.update(ran2_charts)
+        except Exception as e:
+            print(f"  ⚠ RAN2 metrics computation failed: {e}")
 
     print(f"\n✓ Generated {len(generated)} charts in {output_dir}/")
 

@@ -55,6 +55,7 @@ class TradingAgentScenario(BaseAgentScenario):
             await self.setup()
 
             for prompt_index, user_prompt in enumerate(prompts):
+                await self._wait_between_prompts_async(prompt_index)
                 turn_result = await self._run_agent_turn(
                     user_prompt=user_prompt,
                     system_prompt=system_prompt,

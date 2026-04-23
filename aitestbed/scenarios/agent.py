@@ -819,6 +819,7 @@ Be thorough but efficient. Provide actionable recommendations with real data."""
             await self.setup()
 
             for prompt_index, user_prompt in enumerate(prompts):
+                await self._wait_between_prompts_async(prompt_index)
                 turn_result = await self._run_agent_turn(
                     user_prompt=user_prompt,
                     system_prompt=system_prompt,
@@ -912,6 +913,7 @@ Be thorough - fetch multiple sources before synthesizing."""
             await self.setup()
 
             for prompt_index, user_prompt in enumerate(prompts):
+                await self._wait_between_prompts_async(prompt_index)
                 turn_result = await self._run_agent_turn(
                     user_prompt=user_prompt,
                     system_prompt=system_prompt,
@@ -997,6 +999,7 @@ Use these tools effectively to complete the user's request. Be thorough and veri
             await self.setup()
 
             for prompt_index, user_prompt in enumerate(prompts):
+                await self._wait_between_prompts_async(prompt_index)
                 turn_result = await self._run_agent_turn(
                     user_prompt=user_prompt,
                     system_prompt=system_prompt,

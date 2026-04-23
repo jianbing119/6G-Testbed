@@ -252,6 +252,7 @@ class ComputerUseScenario(BaseScenario):
             executor.start()
 
             for turn_index, prompt in enumerate(prompts):
+                self._wait_between_prompts(turn_index)
                 response = None
                 step_index = 0
                 pending_input = self._build_user_input(prompt)

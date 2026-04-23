@@ -314,7 +314,7 @@ docker run -d --name vllm-testbed --gpus all --ipc=host \
     -p 127.0.0.1:8000:8000 \
     vllm/vllm-openai:latest \
     --model Qwen/Qwen3-VL-30B-A3B-Instruct \
-    --max-model-len 131072 --gpu-memory-utilization 0.95 \
+    --max-model-len 32768 --gpu-memory-utilization 0.95 \
     --trust-remote-code --tensor-parallel-size 1
 
 # Stop / remove when done:
@@ -335,7 +335,7 @@ MANAGE_VLLM=false ./test_vllm.sh
 pip install vllm
 vllm serve Qwen/Qwen3-VL-30B-A3B-Instruct \
     --host 0.0.0.0 --port 8000 \
-    --tensor-parallel-size 1 --max-model-len 131072 \
+    --tensor-parallel-size 1 --max-model-len 32768 \
     --gpu-memory-utilization 0.95 --trust-remote-code
 ```
 

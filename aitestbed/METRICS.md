@@ -10,6 +10,7 @@ Detailed documentation of all metrics calculated by the 6G AI Traffic Characteri
 4. [Calculation Methods](#calculation-methods)
 5. [3GPP Output Format](#3gpp-output-format)
 6. [Configuration Parameters](#configuration-parameters)
+7. [RAN2 Methodology Metrics (S4-260859)](#ran2-methodology-metrics-s4-260859)
 
 ---
 
@@ -491,4 +492,168 @@ Gaps between requests:
 | Stall | 5 | event_count, rate, duration (mean, p95, p99) |
 | Burstiness | 6 | peak_to_mean, cv, on_gap (mean, count), off_gap (mean, count) |
 | Error Types | 5 | timeout, rate_limited, server_error, tool_failure, other |
-| **Total** | **56** | |
+| **RAN2 Q1 — UL-heavy** | 8 | ul/dl bytes (totals + distributions), ul/dl ratio, per-dir pkt count/size, per-dir multi-window throughput |
+| **RAN2 Q2 — Bursts** | 8 | per-dir bursts at 10/100ms, burst size/duration/peak-rate dists, inter-burst idle CDF, burstiness-by-window |
+| **RAN2 Q3 — RTT** | 4 | TCP RTT, TLS handshake, HTTP setup-RTT, inter-chunk-gap vs RTT ratio, E2E-latency vs RTT |
+| **RAN2 Q4 — Variability** | 6 | volume distributions, reliability-vs-loss, inter-burst-idle CV, flow-duration, connection-reuse, per-tool sub-flow |
+| **RAN2 Q5 — Tokenized** | 4 | inter-token-gap dist per profile, tokens→bytes regression (UL+DL), token-rate vs DL-pkt-rate |
+| **Subtotal RAN2** | **30** | See [RAN2 Methodology Metrics](#ran2-methodology-metrics-s4-260859) |
+| **Total** | **86** | |
+
+---
+
+## RAN2 Methodology Metrics (S4-260859)
+
+This section documents the metrics added in response to the RAN2 LS (S4-260703) per the methodology laid out in **S4-260859 Annex D**. Every metric is computed by `analysis/ran2_metrics.py::compute_ran2_metrics()` and consumed by the chart/report pipeline. The entry point is a single pure function:
+
+```python
+from analysis.ran2_metrics import compute_ran2_metrics
+
+result = compute_ran2_metrics(
+    records=db_records,               # list[dict] from traffic_logs table
+    pcap_metrics=pcap_analyzer_output,  # optional list[PcapMetrics]
+    profiles_yaml="configs/profiles.yaml",
+)
+# → {"generated_at": ..., "Q1": {...}, "Q2": {...}, "Q3": {...}, "Q4": {...}, "Q5": {...}}
+```
+
+The output is a nested dict keyed by RAN2 question. Each leaf distribution uses the shape `{n, min, p50, p95, p99, max, mean}` (from `_distribution()`), which matches the style of existing testbed metrics.
+
+### Source data
+
+| Source | Where | Used by |
+|---|---|---|
+| `traffic_logs` table (per-turn DB rows) | `logs/traffic_logs.db` | all five questions |
+| `PacketRecord` list (per-packet pcap records) | `PcapMetrics.packets` (populated in `PcapAnalyzer.analyze()`) | Q1.3, Q1.4, Q2.1, Q2.2, Q2.3, Q3.1, Q3.2, Q4.5–Q4.7, Q5.3 |
+| Per-flow TCP stats (handshake RTT, duration, retransmits) | `PcapMetrics.flows[*]` (`TCPFlow`) | Q3.1, Q3.2, Q4.6, Q4.7 |
+| Streaming `inter_chunk_times` (DB column) | per-turn record | Q3.3, Q5.4 |
+| `metadata.record_type == 'tool_call'` rows | per-turn record | Q4.7 |
+| `configs/profiles.yaml:profiles[<name>].loss_pct` | file | Q4.4 |
+
+### Q1 — UL-heavy traffic (`compute_ran2_metrics(...)["Q1"]`)
+
+| # | Metric | Source | Formula / Notes | Field in output |
+|---|---|---|---|---|
+| Q1.1 | UL/DL byte volume per (scenario, profile) | DB `request_bytes`, `response_bytes` | Sum over successful primary turns; report total + distribution | `Q1.per_scenario_profile[<s/p>].ul_bytes_total / dl_bytes_total / ul_bytes_per_turn / dl_bytes_per_turn` |
+| Q1.2 | UL/DL byte ratio | DB | `sum(request_bytes) / sum(response_bytes)` | `Q1.per_scenario_profile[<s/p>].ul_dl_ratio` |
+| Q1.3 | Per-direction packet count + mean packet size | pcap `PacketRecord` | For each pcap: count pkts where `direction == ul/dl`; mean size = bytes/count | `Q1.pcap_per_direction[i].{ul_packets, dl_packets, ul_mean_pkt_size, dl_mean_pkt_size, ul_bytes_total, dl_bytes_total}` |
+| Q1.4 | Per-direction throughput at 1/10/100 ms / 1 s / 10 s windows | pcap `PacketRecord.timestamp + size + direction` | Bucket packets by `int((ts-t0)/window)`; rate = `bucket_bytes · 8 / window` bps; emit `(rel_t, ul_bps, dl_bps)` tuples + peak Mbps per window | `Q1.pcap_per_direction[i].peak_mbps_by_window["1ms"|"10ms"|"100ms"|"1s"|"10s"]` plus full series on `PcapMetrics.throughput_by_window` |
+
+**Code:** `analysis/pcap_analyzer.py::PcapAnalyzer._compute_per_direction_and_multi_window()` (post-processes `metrics.packets` once analyze() completes).
+
+### Q2 — Data bursts and delay-bound (`Q2`)
+
+| # | Metric | Source | Formula / Notes | Field in output |
+|---|---|---|---|---|
+| Q2.1 | Burst detection with **>10 ms / 100 ms** idle-gap per direction | pcap `PacketRecord` sorted per direction | Walk packets; when inter-arrival `iat > gap_sec`, close current burst and start a new one. Emit `{start, end, duration_sec, total_bytes, packet_count, peak_rate_bps}` per burst. | `Q2.per_pcap[i].burst_stats_by_gap["10ms"\|"100ms"][<ul/dl>]` (full bursts list on `PcapMetrics.bursts_by_gap`) |
+| Q2.2 | Burst peak intra-burst rate + inter-burst idle CDF | same | `peak_rate_bps = total_bytes·8 / duration_sec` per burst. Inter-burst idle = `iat` when it crosses the gap threshold. | `Q2.per_pcap[i].burst_stats_by_gap[<gap>][<dir>].peak_rate_mbps` (distribution) and `Q2.per_pcap[i].interburst_idle_by_gap[<gap>][<dir>].cdf_sec` |
+| Q2.3 | Burstiness index (peak/mean) at **1 ms / 10 ms / 100 ms / 1 s / 10 s** windows | pcap multi-window bucketing | For each window, sum UL+DL bytes per bucket, then `peak / mean` of those sums. | `Q2.per_pcap[i].burstiness_by_window["1ms"..."10s"]` |
+| Q2.4 | TTFB (already supported) | DB `t_first_token - t_request_start` | `ttft_values` distribution | `Q2.per_scenario_profile_delay[<s/p>].ttft_sec` |
+| Q2.5 | TTLB (already supported) | DB `t_last_token - t_request_start` | `ttlt_values` distribution | `Q2.per_scenario_profile_delay[<s/p>].ttlt_sec` |
+
+**Code:** burst segmentation + idle gaps in `analysis/pcap_analyzer.py::_compute_per_direction_and_multi_window()` (uses `burst_gaps_sec=(0.010, 0.100)` by default). Distribution aggregation in `analysis/ran2_metrics.py::_q2_bursts()`.
+
+**Caveat (per S4-260859 editor's note):** windows below ~10 ms may be affected by OS scheduler jitter; treat `burstiness_by_window["1ms"]` as indicative.
+
+### Q3 — Round-trip delay (`Q3`)
+
+| # | Metric | Source | Formula / Notes | Field in output |
+|---|---|---|---|---|
+| Q3.1 | TCP handshake RTT (min/median/p95) | pcap `TCPFlow.handshake_rtt` (`ack_time − syn_time`) | Collected during `_process_tcp_packet()`; aggregated into `{min, p50, p95, p99, max, mean}` distribution in ms. | `Q3.tcp_rtt` |
+| Q3.2a | TLS handshake time | per-turn `metadata.tls.handshake_ms` | Aggregated across all primary turns. Honors both `handshake_ms` and `handshake_sec` keys. | `Q3.tls_handshake` |
+| Q3.2b | HTTP connection setup RTT | pcap `TCPFlow.time_to_first_data − TCPFlow.handshake_duration` | Time between the end of TCP handshake and the first application data byte. Clamped at 0. | `Q3.http_setup_rtt` |
+| Q3.3 | Inter-chunk gap vs RTT (streaming) | DB `inter_chunk_times[]` + `Q3.tcp_rtt.p50` | `ratio_p50 = median(inter_chunk_sec) · 1000 / rtt_p50_ms`. Quantifies how much of a stream's inter-chunk gap is attributable to network RTT vs server-side generation. | `Q3.inter_chunk_vs_rtt.{inter_chunk_sec, tcp_rtt_p50_ms, ratio_p50}` |
+| Q3.4 | E2E response latency vs RTT (non-streaming) | DB `latency_sec` + `Q3.tcp_rtt.p50` | Per-turn ratio `(latency·1000)/rtt_p50_ms` aggregated per `(scenario, profile)`. | `Q3.e2e_latency_vs_rtt[<s/p>]` |
+
+**Code:** `analysis/ran2_metrics.py::_q3_rtt()`. TCP handshake times come from `_process_tcp_packet()` in `pcap_analyzer.py`.
+
+### Q4 — Intra-application variability (`Q4`)
+
+| # | Metric | Source | Formula / Notes | Field in output |
+|---|---|---|---|---|
+| Q4.1 | Volume distributions (min/p50/p95/max) + packet-count distribution | DB `request_bytes`, `response_bytes`; pcap `TCPFlow.packets_sent + packets_recv` | Per-scenario: byte distributions from DB, packet-count-per-flow distribution aggregated across all pcap flows in scope. | `Q4.volume_distribution[<scenario>].{request_bytes, response_bytes, packet_count_per_flow}` |
+| Q4.2 | Per-burst size/duration distributions | reuse Q2 burst output | Same `_distribution(sizes)` and `_distribution(durs)` per gap label, per direction. | `Q2.per_pcap[i].burst_stats_by_gap[<gap>][<dir>].{size_bytes, duration_sec}` |
+| Q4.3 | Per-turn TTFB/TTLB across netem profiles | DB | Already computed per (scenario, profile); render as overlay in charts. | `Q2.per_scenario_profile_delay[<s/p>]` |
+| Q4.4 | Reliability vs netem loss rate | DB success flag + profile `loss_pct` from `configs/profiles.yaml` | `success_rate = ok / total` per (scenario, profile). Paired with the profile's nominal `loss_pct`. | `Q4.reliability_by_loss_pct[<s/p>].{turns, success, success_rate, profile_loss_pct}` |
+| Q4.5 | CV of inter-burst idle time per direction | pcap inter-burst idle lists | `cv = stdev/mean`. Returns None on <2 samples or zero mean. | `Q4.inter_arrival_cv[<pcap>][<gap>][<direction>]` |
+| Q4.6 | Flow duration distribution; flows per pcap; connection-reuse ratio | pcap `TCPFlow` | Duration from `TCPFlow.duration`; reuse = `flow_keys_seen_more_than_once / total_flows`; flows-per-pcap = unique flow_keys per pcap. | `Q4.connection_duration.{flow_duration_sec, flows_per_pcap, connection_reuse_ratio}` |
+| Q4.7 | Distinct destination IPs/ports per pcap; per-tool sub-flow volume | pcap `TCPFlow.dst_ip + dst_port`; DB `metadata.record_type=='tool_call'` + `metadata.tool_name` | Distinct `(dst_ip, dst_port)` tuples per pcap; for each tool name: total `request_bytes`, `response_bytes`, `tool_latency_sec`. | `Q4.agentic_flows.{distinct_dests_per_pcap, per_tool_bytes}` |
+
+**Code:** `analysis/ran2_metrics.py::_q4_variability()` and `_per_tool_bytes()`.
+
+**Formulas worth noting explicitly:**
+
+```python
+# Q4.5 — Coefficient of Variation of inter-burst idle gaps
+def _cv(values):
+    if len(values) < 2: return None
+    mean = statistics.mean(values)
+    if mean == 0: return None
+    return statistics.stdev(values) / mean
+
+# Q4.6 — Connection reuse ratio
+# A flow_key is (src_ip:src_port-dst_ip:dst_port). Same 4-tuple seen
+# more than once across pcaps ⇒ connection reused (e.g. HTTP/2 or
+# keep-alive), not a new connection per turn.
+reuse_hits    = sum(1 for fk in flow_keys if already_seen[fk])
+reuse_total   = total_flows
+reuse_ratio   = reuse_hits / reuse_total
+```
+
+### Q5 — Tokenized traffic (`Q5`)
+
+| # | Metric | Source | Formula / Notes | Field in output |
+|---|---|---|---|---|
+| Q5.1 | Token counts per turn (distributions) | DB `tokens_in`, `tokens_out` | Provider-reported when available, `tiktoken`-estimated fallback. | `Q5.token_counts_by_scenario[<scenario>].{tokens_in, tokens_out}` |
+| Q5.2 | Token rate (tokens/s) per scenario | DB `tokens_out / latency_sec` | Per-turn rate; distribution across turns. | `Q5.token_counts_by_scenario[<scenario>].tokens_per_sec` |
+| Q5.3 | Token-arrival rate vs DL-pkt-arrival rate | DB `inter_chunk_times[]`; pcap DL packets | Token rate per profile = `1 / p50(inter_chunk_sec)`; DL pkt rate per pcap = `len(dl_pkts) / (last_ts − first_ts)`. | `Q5.token_arrival_vs_pkt_arrival.{token_rate_per_profile_hz, dl_pkt_rate_hz}` |
+| Q5.4 | Inter-token gap distribution per network profile | DB `inter_chunk_times[]` (streaming only) | Aggregate across streaming turns per profile → `{n, min, p50, p95, p99, max, mean}` in seconds. | `Q5.inter_token_gap_by_profile[<profile>]` |
+| Q5.5 | Tokens → UL/DL byte regression | DB `(tokens_in, request_bytes)`, `(tokens_out, response_bytes)` | Least-squares: `slope = cov(x,y)/var(x)`; `intercept = ȳ − slope·x̄`; `r² = 1 − ss_res/var_y`. | `Q5.token_to_bytes_regression_by_scenario[<scenario>].{ul, dl}` each `{n, slope, intercept, r2}` |
+| Q5.6 | Error resilience / traffic for real-time tokens | (deferred) | Per the pCR, real-time token format still under SA4 study; scaffolding in place, no metric emitted yet. | — |
+
+**Code:** `analysis/ran2_metrics.py::_q5_tokenized()` and `_least_squares()`.
+
+**Interpretation of Q5.5 (the piece RAN2 asked for explicitly):**
+
+The regression coefficients let RAN2 translate a **token-count traffic model** into a **byte-count traffic model**:
+
+- `bytes_ul ≈ slope_ul · tokens_in + intercept_ul`
+- `bytes_dl ≈ slope_dl · tokens_out + intercept_dl`
+
+where `slope` is bytes per token (~1.3 × 4 bytes/token for ASCII-heavy English text, plus HTTP framing overhead absorbed into the intercept). `r²` indicates how well the linear model fits — near 1.0 means a clean linear relationship that RAN2 can use directly; lower values imply the relationship is multi-modal or dominated by fixed-size headers (e.g. base64 attachments dwarfing the token payload in multimodal scenarios).
+
+### Helper: distribution shape
+
+Every RAN2 distribution in the output uses this shape, produced by `_distribution()`:
+
+```python
+def _distribution(values: list[float]) -> dict:
+    if not values:
+        return {"n": 0, "min": None, "p50": None, "p95": None, "p99": None, "max": None, "mean": None}
+    return {
+        "n": len(values),
+        "min": min(values),
+        "p50": _percentile(values, 50),
+        "p95": _percentile(values, 95),
+        "p99": _percentile(values, 99),
+        "max": max(values),
+        "mean": statistics.mean(values),
+    }
+```
+
+`_percentile()` uses linear interpolation between the two nearest ranks (matches NumPy's default `linear` method).
+
+### Enabling the RAN2 metric pipeline
+
+The metrics compute regardless of whether pcap is captured — pcap-dependent fields return empty distributions when `pcap_metrics` is empty. To produce the complete set:
+
+```bash
+# Capture pcap during the run so Q1.3/Q1.4/Q2.x/Q3.1/Q3.2/Q4.5/Q4.6/Q4.7 populate:
+./run_full_tests.sh                   # CAPTURE_PCAP defaults to true
+
+# Regenerate RAN2 metrics (and feed them into charts/report):
+python generate_charts.py --pcap-dir results/captures
+python generate_results_md.py
+```
+
+When pcap is disabled (`CAPTURE_PCAP=false`), the DB-only metrics (Q1.1, Q1.2, Q2.4, Q2.5, Q3.3, Q3.4, Q4.1 partial, Q4.3, Q4.4, Q5.1, Q5.2, Q5.4, Q5.5) still emit; the pcap-only ones are skipped with `n=0` distributions.

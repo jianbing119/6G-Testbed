@@ -392,3 +392,90 @@ class GeminiClient(LLMClient):
                 "payload": response_dump or {"content": content},
             },
         )
+
+    def generate_content_with_document(
+        self,
+        prompt: str,
+        document_path: str,
+        model: str = "gemini-3-flash-preview",
+        **kwargs,
+    ) -> ChatResponse:
+        """
+        Ask a question about a PDF using Gemini's inline_data path.
+
+        The PDF bytes are sent as an inline Part with mime_type application/pdf.
+        For files >~20 MB the File API (upload then reference) is preferred, but
+        inline produces the uplink traffic signature we want to characterize.
+        """
+        import mimetypes
+
+        with open(document_path, "rb") as f:
+            raw = f.read()
+        raw_bytes = len(raw)
+        mime = mimetypes.guess_type(document_path)[0] or "application/pdf"
+
+        doc_part = self._types.Part.from_bytes(data=raw, mime_type=mime)
+
+        system_instruction = kwargs.pop("system_instruction", None)
+        config = self._build_config(system_instruction=system_instruction, **kwargs)
+
+        generate_kwargs = {
+            "model": model,
+            "contents": [prompt, doc_part],
+        }
+        if config:
+            generate_kwargs["config"] = config
+
+        request_bytes = len(prompt.encode("utf-8")) + raw_bytes
+
+        t_start = time.time()
+        response = self._client.models.generate_content(**generate_kwargs)
+        t_end = time.time()
+
+        content = response.text or ""
+
+        tokens_in = None
+        tokens_out = None
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            usage = response.usage_metadata
+            tokens_in = getattr(usage, "prompt_token_count", None)
+            tokens_out = getattr(usage, "candidates_token_count", None)
+        if tokens_in is None:
+            tokens_in = self.estimate_tokens(prompt, model)
+        if tokens_out is None:
+            tokens_out = self.estimate_tokens(content, model)
+
+        response_dump = self._response_to_dict(response)
+        response_bytes = len(content.encode("utf-8"))
+        if response_dump is not None:
+            response_bytes = estimate_payload_bytes(response_dump)
+
+        return ChatResponse(
+            content=content,
+            latency_sec=t_end - t_start,
+            model=model,
+            request_bytes=request_bytes,
+            response_bytes=response_bytes,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            request_payload={
+                "format": "genai.models.generate_content",
+                "payload": {
+                    "model": model,
+                    "contents": [
+                        prompt,
+                        {
+                            "inline_data": {
+                                "mime_type": mime,
+                                "document_path": document_path,
+                                "raw_bytes": raw_bytes,
+                            }
+                        },
+                    ],
+                },
+            },
+            response_payload={
+                "format": "genai.response",
+                "payload": response_dump or {"content": content},
+            },
+        )

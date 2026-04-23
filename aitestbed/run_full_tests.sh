@@ -20,7 +20,7 @@ if [[ -f ".env" ]]; then
 fi
 
 # Configuration
-RUNS_PER_SCENARIO=${RUNS_PER_SCENARIO:-30}
+RUNS_PER_SCENARIO=${RUNS_PER_SCENARIO:-10}
 INTER_SCENARIO_DELAY=${INTER_SCENARIO_DELAY:-2}  # Seconds between scenarios
 INTER_PROVIDER_DELAY=${INTER_PROVIDER_DELAY:-5}  # Seconds between providers
 TRACE_PAYLOADS=${TRACE_PAYLOADS:-1}
@@ -33,7 +33,7 @@ MCP_TRANSPORT=${MCP_TRANSPORT:-http}  # MCP server transport: http (default, net
 ANONYMIZE_DB=${ANONYMIZE_DB:-true}  # Anonymize provider/model names by default
 CLEAN_START=${CLEAN_START:-true}  # Start from a clean database by default
 NETWORK_INTERFACE=${NETWORK_INTERFACE:-auto}  # Network interface for emulation + capture (auto = detect)
-RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-300}  # Per-run timeout in seconds (0 = no timeout)
+RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-600}  # Per-run timeout in seconds (0 = no timeout). 600s = head-room for streaming multi-prompt chat (deepseek-coder, deepseek-reasoner).
 STOP_ON_ERROR=${STOP_ON_ERROR:-true}  # Stop on first failed run (default: true)
 RESUME_MODE=${RESUME_MODE:-false}  # Resume from last successful run
 QUIET_MODE=${QUIET_MODE:-true}  # Show progress bar instead of verbose output
@@ -122,7 +122,7 @@ VLLM_MODEL=${VLLM_MODEL:-Qwen/Qwen3-VL-30B-A3B-Instruct}
 VLLM_HOST=${VLLM_HOST:-127.0.0.1}
 VLLM_PORT=${VLLM_PORT:-8000}
 VLLM_GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.95}
-VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-131072}
+VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}  # 32K context. 128K OOMs KV-cache on single-GPU boxes.
 VLLM_EXTRA_ARGS=${VLLM_EXTRA_ARGS:---trust-remote-code --tensor-parallel-size 1}
 VLLM_LOG=${VLLM_LOG:-logs/vllm_server.log}
 VLLM_PID_FILE=${VLLM_PID_FILE:-logs/vllm_server.pid}
@@ -576,12 +576,21 @@ _start_vllm_docker() {
         mkdir -p "$(dirname "$VLLM_LOG")"
         : > "$VLLM_LOG"
 
+        # Ensure the HF cache mount target exists on the host — docker will
+        # create it if missing, but if your Docker install is rootless or
+        # the parent perms are odd the mount will fail silently.
+        mkdir -p "$VLLM_HF_CACHE" 2>/dev/null || true
+
         log_info "Starting vLLM (docker): image=${VLLM_IMAGE} name=${VLLM_CONTAINER_NAME}"
         log_info "  model=${VLLM_MODEL}  bind=${VLLM_HOST}:${VLLM_PORT}  HF cache=${VLLM_HF_CACHE}"
         log_info "  log: $VLLM_LOG  (timeout ${VLLM_STARTUP_TIMEOUT_SEC}s for model load)"
 
-        local cid err
-        if ! err=$(docker run -d --name "$VLLM_CONTAINER_NAME" \
+        # Capture stdout (container ID) and stderr (errors / image-pull progress)
+        # separately, and mirror stderr to $VLLM_LOG so pull/config errors are
+        # visible instead of scrolling off.
+        local _stderr_file cid rc
+        _stderr_file=$(mktemp -t vllm-run-err.XXXXXX)
+        cid=$(docker run -d --name "$VLLM_CONTAINER_NAME" \
                 --gpus all --ipc=host \
                 -v "${VLLM_HF_CACHE}:/root/.cache/huggingface" \
                 -p "${VLLM_HOST}:${VLLM_PORT}:8000" \
@@ -589,13 +598,42 @@ _start_vllm_docker() {
                 --model "$VLLM_MODEL" \
                 --max-model-len "$VLLM_MAX_MODEL_LEN" \
                 --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
-                $VLLM_EXTRA_ARGS 2>&1); then
-            log_error "docker run failed:"
-            printf '    %s\n' "$err" >&2
+                $VLLM_EXTRA_ARGS 2>"$_stderr_file")
+        rc=$?
+        # Fold stderr into the persistent log for later triage
+        if [[ -s "$_stderr_file" ]]; then
+            {
+                echo "=== docker run stderr ==="
+                cat "$_stderr_file"
+                echo "=== end docker run stderr ==="
+            } >> "$VLLM_LOG"
+        fi
+
+        if [[ "$rc" -ne 0 ]]; then
+            log_error "docker run failed (rc=$rc). stderr:"
+            sed 's/^/    /' "$_stderr_file" >&2 || true
+            rm -f "$_stderr_file"
+            # Clean up any half-created container so the next attempt adopts nothing stale
+            docker rm -f "$VLLM_CONTAINER_NAME" >/dev/null 2>&1 || true
             return 1
         fi
-        cid="$err"
+        rm -f "$_stderr_file"
+
+        if [[ -z "$cid" ]]; then
+            log_error "docker run returned success but no container ID. Check Docker daemon."
+            return 1
+        fi
         log_info "Container started (id=${cid:0:12})"
+
+        # Paranoia: verify the container is actually registered before we enter
+        # the wait loop. If docker_proxy / daemon bridged the run but the
+        # container vanished instantly, surface that now rather than 5 minutes later.
+        if ! docker inspect "$VLLM_CONTAINER_NAME" >/dev/null 2>&1; then
+            log_error "Container '${VLLM_CONTAINER_NAME}' not registered after docker run. "
+            log_error "  Dumping last 40 lines of docker events for this container:"
+            docker events --filter "container=${cid}" --since "1m" --until "0s" 2>&1 | tail -40 | sed 's/^/    /' >&2 || true
+            return 1
+        fi
         VLLM_STARTED_BY_US=true
     fi
 
@@ -603,9 +641,7 @@ _start_vllm_docker() {
     local waited=0
     while (( waited < VLLM_STARTUP_TIMEOUT_SEC )); do
         if ! docker inspect -f '{{.State.Running}}' "$VLLM_CONTAINER_NAME" 2>/dev/null | grep -q '^true$'; then
-            log_error "vLLM container stopped during startup. Tail of docker logs:"
-            docker logs --tail 40 "$VLLM_CONTAINER_NAME" 2>&1 | sed 's/^/    /' >&2 || true
-            docker logs --tail 200 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
+            _dump_vllm_container_diagnostics
             return 1
         fi
         if vllm_reachable; then
@@ -623,11 +659,33 @@ _start_vllm_docker() {
         fi
     done
 
-    log_error "vLLM container did not become ready within ${VLLM_STARTUP_TIMEOUT_SEC}s. Tail of docker logs:"
-    docker logs --tail 40 "$VLLM_CONTAINER_NAME" 2>&1 | sed 's/^/    /' >&2 || true
-    docker logs --tail 200 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
+    log_error "vLLM container did not become ready within ${VLLM_STARTUP_TIMEOUT_SEC}s."
+    _dump_vllm_container_diagnostics
     stop_vllm_server || true
     return 1
+}
+
+# Dump docker-side diagnostics for a vllm container that failed to come up.
+# Shows State (running/exited/dead), ExitCode, OOMKilled, Error, and last 40
+# log lines — or a clear "container does not exist" message if it vanished.
+_dump_vllm_container_diagnostics() {
+    if ! docker inspect "$VLLM_CONTAINER_NAME" >/dev/null 2>&1; then
+        log_error "Container '${VLLM_CONTAINER_NAME}' no longer exists."
+        log_error "  Most common causes:"
+        log_error "    - docker run rejected by the daemon (check preceding stderr)"
+        log_error "    - container was --rm'd elsewhere, or system OOM reaped it"
+        log_error "    - '\$VLLM_CONTAINER_NAME' is in use by another testbed; try: docker ps -a"
+        return
+    fi
+
+    log_error "Container '${VLLM_CONTAINER_NAME}' state:"
+    docker inspect -f $'    status={{.State.Status}}  exit_code={{.State.ExitCode}}  oom={{.State.OOMKilled}}\n    error={{.State.Error}}\n    started_at={{.State.StartedAt}}  finished_at={{.State.FinishedAt}}' \
+        "$VLLM_CONTAINER_NAME" 2>&1 >&2 || true
+
+    log_error "  Tail of docker logs (40 lines):"
+    docker logs --tail 40 "$VLLM_CONTAINER_NAME" 2>&1 | sed 's/^/    /' >&2 || true
+    # Snapshot full log for post-mortem
+    docker logs --tail 500 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
 }
 
 stop_vllm_server() {
@@ -646,8 +704,13 @@ _stop_vllm_docker() {
         return 0
     fi
     log_info "Stopping vLLM container '${VLLM_CONTAINER_NAME}' (timeout ${VLLM_SHUTDOWN_TIMEOUT_SEC}s)..."
-    # Save final logs before removal — useful for post-mortem.
-    docker logs --tail 200 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
+    # Save final logs — but only if $VLLM_LOG doesn't already contain the
+    # crash dump from _dump_vllm_container_diagnostics. Otherwise we'd wipe
+    # it. We snapshot to a side file regardless so nothing is lost.
+    docker logs --tail 500 "$VLLM_CONTAINER_NAME" > "${VLLM_LOG}.final" 2>&1 || true
+    if [[ ! -s "$VLLM_LOG" ]]; then
+        cp "${VLLM_LOG}.final" "$VLLM_LOG" 2>/dev/null || true
+    fi
     if docker stop --time "$VLLM_SHUTDOWN_TIMEOUT_SEC" "$VLLM_CONTAINER_NAME" > /dev/null 2>&1; then
         log_info "vLLM container stopped cleanly"
     else

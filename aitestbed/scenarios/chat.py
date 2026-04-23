@@ -62,6 +62,7 @@ class ChatScenario(BaseScenario):
 
         try:
             for turn_index, prompt in enumerate(prompts):
+                self._wait_between_prompts(turn_index)
                 # Add user message
                 conversation_history.append(ChatMessage(
                     role=MessageRole.USER,

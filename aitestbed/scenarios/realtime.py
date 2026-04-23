@@ -185,6 +185,7 @@ class RealtimeConversationScenario(BaseScenario):
 
             # Send each prompt and collect metrics
             for turn_index, prompt in enumerate(prompts):
+                await self._wait_between_prompts_async(turn_index)
                 turn_metrics = await self._realtime_client.send_text(prompt)
 
                 # Create log record for this turn
@@ -471,6 +472,7 @@ class RealtimeAudioScenario(BaseScenario):
             if not audio_samples and tts_enabled:
                 prompts = self.config.get("prompts", ["Hello, can you hear me?"])
                 for turn_index, prompt in enumerate(prompts):
+                    await self._wait_between_prompts_async(turn_index)
                     input_audio_bytes = None
                     tts_result = self._synthesize_tts_audio(prompt, tts_config)
                     tts_turn_index = -(turn_index + 2)
@@ -547,6 +549,7 @@ class RealtimeAudioScenario(BaseScenario):
             elif not audio_samples:
                 prompts = self.config.get("prompts", ["Hello, can you hear me?"])
                 for turn_index, prompt in enumerate(prompts):
+                    await self._wait_between_prompts_async(turn_index)
                     turn_metrics = await self._realtime_client.send_text(prompt)
 
                     if save_audio:
@@ -575,6 +578,7 @@ class RealtimeAudioScenario(BaseScenario):
             else:
                 # Process audio samples
                 for turn_index, audio_sample in enumerate(audio_samples):
+                    await self._wait_between_prompts_async(turn_index)
                     audio_data = self._load_audio_sample(audio_sample)
                     if audio_data is None:
                         continue
