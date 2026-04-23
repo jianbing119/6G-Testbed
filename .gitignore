@@ -47,6 +47,7 @@
 
 **/results/
 **/RESULTS.md
+**/TRACES.md
 
 # ML artifacts (regenerable from pcaps + training scripts)
 ml/models/
