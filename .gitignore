@@ -27,6 +27,8 @@
 **/*.docx
 **/*.xlsx
 !aitestbed/run_full_tests.sh
+!aitestbed/test_profiles.sh
+!aitestbed/test_vllm.sh
 !netemu/scripts/apply_profile.sh
 !netemu/scripts/clear_profile.sh
 !aitestbed/docker/entrypoint.sh
@@ -45,6 +47,7 @@
 
 **/results/
 **/RESULTS.md
+**/TRACES.md
 
 # ML artifacts (regenerable from pcaps + training scripts)
 ml/models/

@@ -1,20 +1,26 @@
-# Selected network profile subset for 6G AI traffic studies.
-# Includes the eight-profile core set plus a no-emulation reference case.
+# Network profiles for 6G AI traffic studies.
+# Profile catalog per 3GPP SA4 contribution S4-260848 (Table C.Z-1).
+#
+# Asymmetric profiles use an optional `uplink:` sub-block. Base fields
+# describe the symmetric / downlink case. When `uplink:` is present, egress
+# uses (base ⊕ uplink) (shallow per-field merge), ingress uses base
+# unchanged. Profiles without an `uplink:` block are treated as symmetric.
 
 selected_profiles:
   - no_emulation
-  - ideal_6g
+  - 6g_itu_hrllc
   - 5g_urban
   - wifi_good
   - cell_edge
-  - satellite
+  - satellite_leo
+  - satellite_geo
   - congested
   - 5qi_7
   - 5qi_80
 
 profiles:
   no_emulation:
-    description: "Reference case with no tc/netem impairment applied"
+    description: "Reference case with no tc/netem impairment applied (ideal baseline)"
     delay_ms: 0
     jitter_ms: 0
     delay_distribution: fixed
@@ -26,21 +32,21 @@ profiles:
     limit_packets: null
     rate_mbit: null
 
-  ideal_6g:
-    description: "Deterministic baseline and upper-bound reference"
+  6g_itu_hrllc:
+    description: "6G HRLLC operating point derived from ITU IMT-2030 (M.2160)"
     delay_ms: 1
-    jitter_ms: 0
-    delay_distribution: fixed
-    loss_pct: 0.0
-    loss_correlation_pct: 0
+    jitter_ms: 0.2
+    delay_distribution: normal
+    loss_pct: 0.001
+    loss_correlation_pct: 10
     reorder_pct: 0.0
     reorder_correlation_pct: 0
     duplicate_pct: 0.0
-    limit_packets: 1000
-    rate_mbit: null
+    limit_packets: 2000
+    rate_mbit: 300
 
   5g_urban:
-    description: "Mainstream terrestrial cellular reference"
+    description: "Mainstream urban terrestrial cellular reference"
     delay_ms: 20
     jitter_ms: 5
     delay_distribution: normal
@@ -54,7 +60,7 @@ profiles:
     rate_mbit: 100
 
   wifi_good:
-    description: "Non-3GPP local access with moderate contention"
+    description: "Non-3GPP local access with moderate contention (fictional average of common Wi-Fi configurations)"
     delay_ms: 30
     jitter_ms: 10
     delay_distribution: normal
@@ -81,19 +87,51 @@ profiles:
     limit_packets: 400
     rate_mbit: 5
 
-  satellite:
-    description: "Remote-access and extreme RTT case"
-    delay_ms: 600
-    jitter_ms: 50
+  # ---------------------------------------------------------------------------
+  # Asymmetric NTN profiles (S4-260848 Table C.Z-1).
+  # Base block = downlink. `uplink:` block lists egress overrides only —
+  # any field not listed under `uplink:` is inherited from the base.
+  # ---------------------------------------------------------------------------
+
+  satellite_leo:
+    description: "LEO satellite (asymmetric uplink) — NTN-like latency stress"
+    delay_ms: 22
+    jitter_ms: 7
     delay_distribution: normal
-    loss_model: gemodel
     loss_pct: 0.5
-    loss_correlation_pct: 20
-    reorder_pct: 0.02
-    reorder_correlation_pct: 50
+    loss_correlation_pct: 40
+    reorder_pct: 0.1
+    reorder_correlation_pct: 15
     duplicate_pct: 0.0
-    limit_packets: 600
-    rate_mbit: 10
+    limit_packets: 10000
+    rate_mbit: 100
+    uplink:
+      jitter_ms: 8
+      loss_pct: 0.8
+      loss_correlation_pct: 45
+      reorder_pct: 0.05
+      reorder_correlation_pct: 10
+      limit_packets: 5000
+      rate_mbit: 15
+
+  satellite_geo:
+    description: "GEO satellite (asymmetric uplink) — long-RTT remote access"
+    delay_ms: 340
+    jitter_ms: 15
+    delay_distribution: normal
+    loss_pct: 0.1
+    loss_correlation_pct: 20
+    reorder_pct: 0.0
+    reorder_correlation_pct: 0
+    duplicate_pct: 0.0
+    limit_packets: 20000
+    rate_mbit: 50
+    uplink:
+      jitter_ms: 18
+      loss_pct: 0.2
+      loss_correlation_pct: 25
+      limit_packets: 10000
+      rate_mbit: 3
 
   congested:
     description: "Bufferbloat and strong congestion stress case"
@@ -109,9 +147,13 @@ profiles:
     limit_packets: 200
     rate_mbit: 1
 
+  # ---------------------------------------------------------------------------
+  # 5QI anchors (per S4-260848: delay_ms = PDB - 2.054 × jitter_ms when jitter > 0)
+  # ---------------------------------------------------------------------------
+
   5qi_7:
-    description: "Managed conversational and live-streaming anchor"
-    delay_ms: 100
+    description: "5QI 7 Non-GBR — Voice / Live Streaming / Interactive Gaming (PDB 100ms, PER 1e-3)"
+    delay_ms: 80
     jitter_ms: 10
     delay_distribution: normal
     loss_model: correlated
@@ -124,8 +166,8 @@ profiles:
     rate_mbit: null
 
   5qi_80:
-    description: "Managed low-latency QoS anchor"
-    delay_ms: 10
+    description: "5QI 80 Non-GBR — Low Latency eMBB / AR (PDB 10ms, PER 1e-6)"
+    delay_ms: 8
     jitter_ms: 1
     delay_distribution: normal
     loss_model: correlated
@@ -137,5 +179,6 @@ profiles:
     limit_packets: 1000
     rate_mbit: null
 
+# Default interface for network emulation (auto = detect)
 default_interface: "auto"
 bidirectional: true

@@ -7,9 +7,15 @@ scenarios:
   #   loopback_interface: auxiliary loopback interface used by scenario code for
   #     HTTP-mode MCP shaping. This documents the expected path; the agent scenarios
   #     already apply loopback tc rules internally when mcp_transport=http.
+  # Scenario-level timing fields:
+  #   inter_prompt_delay_sec: seconds to sleep BETWEEN prompts within the same
+  #     session (simulates user think-time). Default 0 — prompts fire back-to-back.
+  #     Skipped before the first prompt. Applied by all multi-prompt scenarios
+  #     (chat, multimodal, image, video, computer_use, realtime, agent variants).
 
   chat_basic:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Basic single-turn chat interaction"
     provider: "openai"
     model: "gpt-5-mini"
@@ -21,6 +27,7 @@ scenarios:
 
   chat_streaming:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Multi-turn chat with streaming responses"
     provider: "openai"
     model: "gpt-5-mini"
@@ -33,6 +40,7 @@ scenarios:
 
   chat_gemini:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Chat interaction using Google Gemini"
     provider: "gemini"
     model: "gemini-3-flash-preview"
@@ -47,6 +55,7 @@ scenarios:
 
   chat_vllm:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Chat interaction using vLLM-hosted Qwen3-VL"
     provider: "vllm"
     model: "Qwen/Qwen3-VL-30B-A3B-Instruct"
@@ -59,12 +68,16 @@ scenarios:
 
   video_understanding_vllm:
     type: "video_understanding"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Video understanding via vLLM (Qwen3-VL, base64-encoded upload)"
     provider: "vllm"
     model: "Qwen/Qwen3-VL-30B-A3B-Instruct"
     network_interface: "lo"
     stream: false
-    video_url: "file:///root/workspace/test1.mp4"
+    # Bundled test asset (~1 MB). Resolved relative to the orchestrator's
+    # CWD (aitestbed/). Override with VIDEO_PATH or by editing this entry
+    # if you have a longer benchmark clip.
+    video_path: "examples/assets/test_video.mp4"
     prompts:
       - "Describe the main actions in the video."
 
@@ -74,6 +87,7 @@ scenarios:
 
   chat_deepseek:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Basic chat interaction using DeepSeek"
     provider: "deepseek"
     model: "deepseek-chat"
@@ -85,6 +99,7 @@ scenarios:
 
   chat_deepseek_streaming:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Streaming chat interaction using DeepSeek"
     provider: "deepseek"
     model: "deepseek-chat"
@@ -97,6 +112,7 @@ scenarios:
 
   chat_deepseek_coder:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Code-focused chat using DeepSeek Coder"
     provider: "deepseek"
     model: "deepseek-coder"
@@ -108,6 +124,7 @@ scenarios:
 
   chat_deepseek_reasoner:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Deep reasoning chat using DeepSeek Reasoner (R1)"
     provider: "deepseek"
     model: "deepseek-reasoner"
@@ -119,6 +136,7 @@ scenarios:
 
   shopping_agent_deepseek:
     type: "agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Shopping assistant with tool calling using DeepSeek"
     provider: "deepseek"
     model: "deepseek-chat"
@@ -136,6 +154,7 @@ scenarios:
 
   web_search_agent_deepseek:
     type: "agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Research agent with web search capability using DeepSeek"
     provider: "deepseek"
     model: "deepseek-chat"
@@ -151,10 +170,11 @@ scenarios:
 
   direct_web_search_deepseek:
     type: "direct_search"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Multi-threaded web search with DeepSeek synthesis"
     provider: "deepseek"
     model: "deepseek-chat"
-    search_engine: "duckduckgo"
+    search_engine: "brave"
     thread_count: 5
     search_timeout: 30.0
     max_results: 10
@@ -169,6 +189,7 @@ scenarios:
 
   shopping_agent:
     type: "agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Shopping assistant with tool calling"
     provider: "openai"
     model: "gpt-5-mini"
@@ -186,6 +207,7 @@ scenarios:
 
   web_search_agent:
     type: "agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Research agent with web search capability"
     provider: "openai"
     model: "gpt-5-mini"
@@ -201,6 +223,7 @@ scenarios:
 
   general_agent:
     type: "general_agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "General-purpose agent with full MCP access"
     provider: "openai"
     model: "gpt-5.2"
@@ -212,9 +235,10 @@ scenarios:
 
   computer_control_agent:
     type: "computer_use"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Computer use agent via OpenAI computer tool"
     provider: "openai"
-    model: "computer-use-preview"
+    model: "gpt-5.4"
     max_steps: 12
     execution_backend: "playwright"
     environment: "browser"
@@ -230,6 +254,7 @@ scenarios:
 
   image_generation:
     type: "image"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Image generation using DALL-E"
     provider: "openai"
     model: "gpt-image-1.5"
@@ -242,14 +267,21 @@ scenarios:
 
   multimodal_analysis:
     type: "multimodal"
-    description: "Multimodal input analysis (image + text)"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
+    description: "Multimodal input analysis (PDF + images + text)"
     provider: "gemini"
     model: "gemini-3-flash-preview"
-    image_paths:
-      - "examples/assets/network_diagram.png"
-      - "examples/assets/traffic_pattern.png"
-      - "examples/assets/latency_heatmap_sample.png"
+    # Per-prompt media — one entry per prompt, in order.
+    # First turn uploads a PDF (uplink-heavy, inline_data Part); remaining
+    # three upload images. Resolved relative to the orchestrator's CWD
+    # (aitestbed/).
+    media:
+      - {document: "../../Math_olympiad.pdf"}
+      - {image: "examples/assets/network_diagram.png"}
+      - {image: "examples/assets/traffic_pattern.png"}
+      - {image: "examples/assets/latency_heatmap_sample.png"}
     prompts:
+      - "Solve question 6 in the attached PDF. Show your work."
       - "Analyze this network diagram and describe the traffic flow between components"
       - "Describe the traffic pattern shown in this visualization. What type of AI workload does it represent?"
       - "Analyze this latency heatmap. Which scenarios and network profiles show the best performance?"
@@ -260,6 +292,7 @@ scenarios:
 
   realtime_text:
     type: "realtime_conversation"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Real-time conversational AI using WebSocket (text mode)"
     provider: "openai"
     model: "gpt-realtime-mini"
@@ -274,6 +307,7 @@ scenarios:
 
   realtime_text_webrtc:
     type: "realtime_conversation_webrtc"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Real-time conversational AI using WebRTC (text mode)"
     provider: "openai"
     model: "gpt-realtime-mini"
@@ -287,6 +321,7 @@ scenarios:
 
   realtime_interactive:
     type: "realtime_conversation"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Interactive real-time conversation simulating voice assistant"
     provider: "openai"
     model: "gpt-realtime-mini"
@@ -303,6 +338,7 @@ scenarios:
 
   realtime_technical:
     type: "realtime_conversation"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Technical support real-time conversation"
     provider: "openai"
     model: "gpt-realtime-mini"
@@ -318,6 +354,7 @@ scenarios:
 
   realtime_multilingual:
     type: "realtime_conversation"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Multilingual real-time conversation for testing language handling"
     provider: "openai"
     model: "gpt-realtime-mini"
@@ -333,6 +370,7 @@ scenarios:
 
   realtime_audio:
     type: "realtime_audio"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Audio-based real-time conversation (voice in/voice out)"
     provider: "openai"
     model: "gpt-realtime-mini"
@@ -356,6 +394,7 @@ scenarios:
 
   realtime_audio_webrtc:
     type: "realtime_audio_webrtc"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Audio-based real-time conversation over WebRTC (voice in/voice out)"
     provider: "openai"
     model: "gpt-realtime-mini"
@@ -383,6 +422,7 @@ scenarios:
 
   chat_azure_openai:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Chat interaction using Azure OpenAI (GPT-5.2 deployment)"
     disabled: true
     provider: "azure_openai"
@@ -395,6 +435,7 @@ scenarios:
 
   chat_azure_openai_streaming:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Streaming chat using Azure OpenAI"
     disabled: true
     provider: "azure_openai"
@@ -408,6 +449,7 @@ scenarios:
 
   shopping_agent_azure_openai:
     type: "agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Shopping assistant with tool calling using Azure OpenAI"
     disabled: true
     provider: "azure_openai"
@@ -424,6 +466,7 @@ scenarios:
 
   image_generation_azure:
     type: "image"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Image generation using GPT Image on Azure OpenAI"
     disabled: true
     provider: "azure_openai"
@@ -441,6 +484,7 @@ scenarios:
 
   chat_azure_inference:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Chat interaction using Azure AI Inference (Phi-4-mini)"
     disabled: true
     provider: "azure_inference"
@@ -453,6 +497,7 @@ scenarios:
 
   chat_azure_inference_streaming:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Streaming chat using Azure AI Inference (Phi-4-mini)"
     disabled: true
     provider: "azure_inference"
@@ -466,6 +511,7 @@ scenarios:
 
   chat_azure_inference_llama:
     type: "chat"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Streaming chat using Azure AI Inference (Llama 4 Maverick)"
     disabled: true
     provider: "azure_inference"
@@ -482,6 +528,7 @@ scenarios:
 
   music_search:
     type: "music_agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Music search agent using Spotify MCP tools"
     disabled: true
     provider: "openai"
@@ -497,6 +544,7 @@ scenarios:
 
   music_playlist:
     type: "music_agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Playlist composition agent using Spotify recommendations"
     disabled: true
     provider: "openai"
@@ -512,6 +560,7 @@ scenarios:
 
   music_research:
     type: "music_research_agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Music research agent combining Spotify and web search"
     disabled: true
     provider: "openai"
@@ -526,6 +575,7 @@ scenarios:
 
   music_search_deepseek:
     type: "music_agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Music search agent using DeepSeek with Spotify MCP"
     disabled: true
     provider: "deepseek"
@@ -544,6 +594,7 @@ scenarios:
 
   trading_market_data:
     type: "trading_agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Market data analysis agent using Alpaca MCP tools"
     provider: "openai"
     model: "gpt-5-mini"
@@ -558,6 +609,7 @@ scenarios:
 
   trading_options_scan:
     type: "trading_agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Options market data scan using Alpaca MCP tools"
     disabled: true  # Upstream bug: alpaca-mcp-server uses wrong endpoint for options contracts (404)
     provider: "openai"
@@ -576,6 +628,7 @@ scenarios:
 
   playwright_web_test:
     type: "playwright_agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Browser automation agent using Playwright MCP tools"
     provider: "openai"
     model: "gpt-5-mini"
@@ -589,6 +642,7 @@ scenarios:
 
   playwright_web_test_text:
     type: "playwright_agent"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Browser automation agent using text extraction (no screenshots)"
     provider: "openai"
     model: "gpt-5-mini"
@@ -607,10 +661,11 @@ scenarios:
 
   direct_web_search:
     type: "direct_search"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Multi-threaded web search without MCP, using direct HTTP"
     provider: "openai"
     model: "gpt-5-mini"
-    search_engine: "duckduckgo"  # Options: google, duckduckgo
+    search_engine: "brave"  # Options: google, duckduckgo, brave
     thread_count: 5
     search_timeout: 30.0
     max_results: 10
@@ -625,6 +680,7 @@ scenarios:
 
   direct_web_search_google:
     type: "direct_search"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Multi-threaded web search using Google Custom Search API"
     disabled: true
     provider: "openai"
@@ -643,10 +699,11 @@ scenarios:
 
   direct_web_search_burst:
     type: "direct_search"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "High-parallelism burst search (stress test)"
     provider: "openai"
     model: "gpt-5-mini"
-    search_engine: "duckduckgo"
+    search_engine: "brave"
     thread_count: 20
     search_timeout: 60.0
     max_results: 5
@@ -675,6 +732,7 @@ scenarios:
 
   parallel_search_benchmark:
     type: "parallel_search_benchmark"
+    inter_prompt_delay_sec: 0  # sec between prompts; 0 = back-to-back
     description: "Benchmark parallel search performance with varying thread counts"
     provider: "openai"
     model: "gpt-5-mini"
@@ -705,11 +763,12 @@ defaults:
 runner_profile_sets:
   full_suite_profiles: &full_suite_profiles
     - no_emulation
-    - ideal_6g
+    - 6g_itu_hrllc
     - 5g_urban
     - wifi_good
     - cell_edge
-    - satellite
+    - satellite_leo
+    - satellite_geo
     - congested
     - 5qi_7
     - 5qi_80
@@ -811,6 +870,7 @@ test_matrix:
     prereqs:
       - "ALPACA_API_KEY"
       - "ALPACA_SECRET_KEY"
+      - "cmd:uvx"
 
   - scenario: "trading_options_scan"
     phase: "trading"
@@ -820,6 +880,7 @@ test_matrix:
     prereqs:
       - "ALPACA_API_KEY"
       - "ALPACA_SECRET_KEY"
+      - "cmd:uvx"
 
   - scenario: "computer_control_agent"
     phase: "computer_use"
@@ -844,6 +905,7 @@ test_matrix:
     runner_enabled_by_default: true
     prereqs:
       - "examples/assets/network_diagram.png"
+      - "../../Math_olympiad.pdf"
 
   - scenario: "direct_web_search_google"
     phase: "google_search"
@@ -881,3 +943,4 @@ test_matrix:
     runner_enabled_by_default: true
     prereqs:
       - "http://localhost:8000/v1/models"
+      - "examples/assets/test_video.mp4"

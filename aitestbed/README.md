@@ -11,6 +11,144 @@ The testbed enables:
 - **Evaluation** of QoE metrics under emulated network conditions (latency, loss, bandwidth)
 - **Reporting** in formats suitable for 3GPP standardization contributions
 
+## Cross-Checking for SA4 AI Traffic Characterization
+
+For 3GPP SA4 cross-checking (reproducing or validating contributed results), the canonical entry point is **`run_full_tests.sh`**. It drives the full test matrix in `configs/scenarios.yaml` across the 10 SA4 S4-260848 network profiles, captures L3/L4 PCAPs, and runs the complete post-processing pipeline (charts, Excel, `RESULTS.md`, `TRACES.md`, DB anonymization).
+
+### Quick start
+
+```bash
+cd aitestbed
+cp .env.example .env          # fill in at least OPENAI_API_KEY
+
+# Smoke test — 3 runs/scenario, ~30 min depending on scenarios enabled
+bash run_full_tests.sh --quick
+
+# Cross-check run — 30 runs/scenario (default --full), hours to a day
+bash run_full_tests.sh
+
+# Narrow to a single phase to reproduce a specific contribution
+bash run_full_tests.sh --enable chat --runs 30
+bash run_full_tests.sh --enable realtime --runs 30
+bash run_full_tests.sh --enable vllm --runs 30
+```
+
+### Parameters and when to use them
+
+| Flag | Effect | When to use |
+|:-----|:-------|:------------|
+| `--quick` | 3 runs/scenario, short delays | Smoke test before a long run; verifying config/env |
+| `--full` | 30 runs/scenario (default) | Publishable statistics — recommended for SA4 cross-check |
+| `--runs N` | Exact number of runs | Match the run count used in the contribution being cross-checked |
+| `--enable LIST` | Only run listed phases (comma-sep.) | Reproducing a specific scenario family |
+| `--disable LIST` | Skip listed phases | Skip what you cannot run (no API key, no GPU, etc.) |
+| `--stress` | Enable burst/parallel stress phase | Only for stress-testing contributions (opt-in) |
+| `--no-capture` | Disable L3/L4 PCAP | Debugging only — **leave ON for cross-check runs** |
+| `--no-anonymize` | Keep real provider/model names | Internal triage; SA4 submissions use anonymized DB |
+| `--no-clean` | Keep prior DB and pcaps | Accumulate across runs (off by default) |
+| **`--resume`** | **Skip already-completed combos, append to existing DB** | **Critical: use whenever a previous run was interrupted or a scenario failed. Implies `--no-clean`. See dedicated section below.** |
+| `--verbose, -v` | Show full log instead of progress bar | Debugging; default is a single progress bar |
+
+Phase names (for `--enable` / `--disable`): `chat, realtime, image, search, deepseek, gemini, music, trading, computer_use, playwright, multimodal, google_search, stress, vllm`.
+
+### `--resume`: recovering an interrupted run
+
+SA4 cross-check runs can easily take 8–24 hours. **Assume at least one will be interrupted** — a quota error, a SIGKILL, a laptop lid, an OS reboot, or a single flaky scenario can derail a long matrix. `--resume` is how you pick up where you left off without losing the hours of data already captured.
+
+**What it does.** Re-run with the same parameters and add `--resume`:
+
+```bash
+bash run_full_tests.sh --resume                   # keep original defaults
+bash run_full_tests.sh --resume --runs 30         # match original run count
+bash run_full_tests.sh --resume --enable vllm     # resume just one phase
+```
+
+On startup the script queries `logs/traffic_logs.db` once and drops every `(scenario, profile)` combo that already has `≥ RUNS_PER_SCENARIO` completed sessions from the test matrix. Remaining combos get their missing runs filled in; new runs append to the DB under fresh `session_id`s — no existing records are rewritten.
+
+**Implies `--no-clean`.** `--resume` does **not** archive or wipe `logs/traffic_logs.db`, `results/captures/`, or `results/reports/`. That is the whole point — pass it **exactly when** you want to preserve prior data.
+
+**What counts as "completed"** (orchestrator.py `get_completed_runs`):
+
+| Session kind | Resume treats it as | Reason |
+|:-------------|:--------------------|:-------|
+| All records `success=1` for that session | ✓ completed — **skipped** | Data point is valid |
+| `session_id LIKE 'timeout_%'` | ✓ completed — **skipped** | Timeout under harsh profiles is a legitimate measurement, not an error to retry |
+| Any record `success=0` in the session | ✗ not completed — **retried** | Real failure, e.g. API error / crash — must produce a clean run |
+| `session_id LIKE 'pcap_%'` | ignored (not a run) | Capture-only placeholder, excluded from counting |
+
+Because successful sessions and timeout placeholders both count, the target run count eventually fills even under lossy profiles like `cell_edge` or `satellite_geo`.
+
+**When to use `--resume`:**
+
+- The run was interrupted for any reason (`Ctrl-C`, SIGKILL, OOM, reboot, power loss).
+- `STOP_ON_ERROR=true` (default) tripped on a single failing scenario — fix the cause (quota, network, API key) and resume. The message `Test suite stopped due to failure. Re-run with --resume to continue.` is the prompt to do this.
+- You ran `--quick` first to sanity-check and now want to top up to `--full` (pass `--resume --full` — existing 3 runs count against the 30-run target).
+- A long phase (e.g. `vllm`, `realtime`) failed due to transient infra; fix the infra and `bash run_full_tests.sh --resume --enable <phase>`.
+
+**When NOT to use `--resume`:**
+
+- You changed `configs/profiles.yaml` or a scenario's model/provider/prompt. The prior runs are no longer comparable — start fresh (drop `--resume`, let `CLEAN_START=true` archive the old DB).
+- You are starting a brand-new cross-check. First run should not have `--resume` — it wipes-and-archives correctly on its own.
+- You want a deterministic, single-batch dataset where every record was produced by one invocation. `--resume` stitches across invocations; this is usually fine for SA4 cross-check but explicit to call out.
+
+**Safety properties.** Every `--resume` invocation (a) archives nothing, (b) mutates no existing rows, (c) only appends new sessions, (d) re-runs post-processing (`RESULTS.md`, charts, Excel) over the full DB at the end, so the final artifacts reflect all accumulated data — not just the resumed slice. Running `--resume` against a fully-complete DB is a no-op for data collection; it will just regenerate the reports.
+
+**Tip:** pair long runs with `nohup` or `tmux` so an SSH drop does not kill the script. Even so, leave `--resume` in your pocket — you will need it.
+
+Key environment variables (see `--help` for the full list):
+
+| Variable | Default | Purpose |
+|:---------|:--------|:--------|
+| `RUNS_PER_SCENARIO` | 30 | Runs per scenario/profile combo |
+| `RUN_TIMEOUT_SEC` | 600 | Per-run timeout; raise for slow reasoning models |
+| `NETWORK_INTERFACE` | `auto` | Pin a specific egress interface instead of auto-detect |
+| `MCP_TRANSPORT` | `http` | MCP over HTTP so tool traffic is shaped by tc/netem. Set `stdio` only to bypass shaping for MCP |
+| `CAPTURE_FILTER` | `port 443 or 80 or 8080 or 8000` | BPF filter; extend if a scenario uses other ports |
+| `MANAGE_VLLM` | `true` | Auto-start/stop the vLLM container. Set `false` when you already run vLLM yourself |
+| `VLLM_BACKEND` | `docker` | `docker` (recommended) or `host` (needs `vllm` on PATH) |
+| `STOP_ON_ERROR` | `true` | Stop on first failed run (use `--resume` to continue) |
+
+### Typical pitfalls
+
+- **Passwordless `sudo` for `tc`/`tcpdump` is required.** Without it the script warns and skips network emulation, giving you `no_emulation`-only results. Fix:
+  ```bash
+  TCPDUMP_PATH=$(which tcpdump)
+  echo "$USER ALL=(ALL) NOPASSWD: /usr/sbin/tc, $TCPDUMP_PATH, /usr/sbin/modprobe, /usr/sbin/ip" \
+    | sudo tee /etc/sudoers.d/testbed && sudo chmod 440 /etc/sudoers.d/testbed
+  ```
+- **Stale netem qdiscs** from a crashed prior run cause bizarre first-scenario numbers. The script clears them on start and on `EXIT/INT/TERM`, but if you killed it with `SIGKILL`, run once with any profile to reset, or clear manually:
+  ```bash
+  sudo tc qdisc del dev <iface> root; sudo tc qdisc del dev <iface> ingress
+  sudo tc qdisc del dev lo root;     sudo tc qdisc del dev lo ingress
+  sudo tc qdisc del dev ifb0 root;   sudo ip link set dev ifb0 down
+  ```
+- **vLLM scenarios need a GPU** and ~30 GB VRAM for the default `Qwen3-VL-30B-A3B-Instruct`. If you do not have one, `--disable vllm`. If you already manage vLLM yourself, run with `MANAGE_VLLM=false`.
+- **Docker vLLM**: the user must be in the `docker` group (`sudo usermod -aG docker $USER && newgrp docker`) and `nvidia-container-toolkit` installed. Verify with `docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi` first.
+- **Missing API keys silently skip phases.** The prereq check logs `-` lines for each missing key. Inspect the preamble before a long run — a greyed-out phase produces no data.
+- **Playwright phase needs Chromium installed:** `pip install playwright && playwright install chromium`. Same for the `computer_use` phase.
+- **Run timeouts** on DeepSeek Reasoner / long agent chains: raise `RUN_TIMEOUT_SEC=1200` (or higher) if you see `timeout_*` session IDs in the DB.
+- **First PCAP on loopback is empty**: MCP-over-HTTP traffic capture needs `CAPTURE_LOOPBACK=true` (default). If you set `MCP_TRANSPORT=stdio`, tool traffic is not shaped and not captured — this is intentional but not what you want for SA4 cross-check.
+- **API rate limits / quota errors** show up as red `ERROR` rows in the DB with non-zero `http_status`. Re-run with `--resume` after the quota resets; `--resume` skips combos that already have `RUNS_PER_SCENARIO` successful sessions.
+- **Disk and time budget**: a full run (30 runs × full matrix × 10 profiles with PCAP) produces a few GB of pcaps and can run 8–24 h depending on enabled providers. Use `--enable <phase>` to cross-check one contribution at a time.
+
+### What you get
+
+After a successful run, the following artifacts are produced (paths relative to `aitestbed/`):
+
+| Artifact | Path | Description |
+|:---------|:-----|:------------|
+| SQLite DB | `logs/traffic_logs.db` | Per-request records: bytes, tokens, TTFT, TTLT, success, http_status, scenario, profile |
+| JSON report | `results/reports/experiment_report.json` | Aggregated metrics in 3GPP-compatible schema |
+| Evaluation report | `RESULTS.md` | Full write-up with tables per scenario/profile |
+| Traces | `TRACES.md` | Sample request/response traces per scenario |
+| Charts | `results/reports/figures/` | Latency CDFs, TTFT/TTLT, throughput, heatmaps, pcap-derived plots |
+| Excel workbook | `results/reports/chart_data.xlsx` | 15-sheet export of all metrics for spreadsheet review |
+| PCAPs | `results/captures/` | L3/L4 tcpdump per scenario/profile (default filter: HTTPS/HTTP/8080/8000) |
+| L7 logs | `results/l7_captures/` | mitmproxy HTTP frame logs (when enabled) |
+| Backup | `logs/backups/<timestamp>/` | Snapshot of prior DB/PCAPs when running with default `--clean` |
+
+The run ends with a summary banner showing duration, total records, success rate, and any scenario failures with per-scenario log paths for triage. For SA4 cross-checking, attach `RESULTS.md`, the figures directory, and (if requested) the anonymized `logs/traffic_logs.db`.
+
 ## Scenarios
 
 ### Chat
@@ -80,35 +218,26 @@ The testbed enables:
 | `direct_web_search_burst` | DuckDuckGo | 20 | No | Burst stress test |
 | `parallel_search_benchmark` | DuckDuckGo | 1-20 | No | Parallelism benchmark |
 
-### Azure (Disabled by Default)
-
-| Scenario | Provider | Model | Description |
-|:---------|:---------|:------|:------------|
-| `chat_azure_openai` | Azure OpenAI | gpt-5.2 | Azure-hosted GPT |
-| `chat_azure_openai_streaming` | Azure OpenAI | gpt-5.2 | Azure-hosted GPT (streaming) |
-| `shopping_agent_azure_openai` | Azure OpenAI | gpt-5.2 | Shopping agent via Azure |
-| `image_generation_azure` | Azure OpenAI | gpt-image-1-mini | Image generation via Azure |
-| `chat_azure_inference` | Azure Inference | Phi-4-mini | Phi-4 chat |
-| `chat_azure_inference_streaming` | Azure Inference | Phi-4-mini | Phi-4 streaming |
-| `chat_azure_inference_llama` | Azure Inference | Llama-4-Maverick | Llama 4 streaming |
-
 ## Network Profiles
 
-The test matrix uses 9 selected profiles from `configs/profiles.yaml`:
+The test matrix uses the 10 selected profiles from `configs/profiles.yaml`, aligned with 3GPP SA4 contribution **S4-260848 (Table C.Z-1)**:
 
-| Profile | Delay | Jitter | Loss | Rate | Loss Model | Description |
-|:--------|:------|:-------|:-----|:-----|:-----------|:------------|
-| `no_emulation` | 0 ms | 0 ms | 0% | -- | -- | Reference (no tc/netem) |
-| `ideal_6g` | 1 ms | 0 ms | 0% | -- | fixed | Deterministic baseline |
-| `5g_urban` | 20 ms | 5 ms | 0.1% | 100 Mbps | correlated | Mainstream terrestrial cellular |
-| `wifi_good` | 30 ms | 10 ms | 0.1% | 50 Mbps | correlated | Home/office WiFi |
-| `cell_edge` | 120 ms | 30 ms | 1% | 5 Mbps | Gilbert-Elliot | Poor coverage, heavy-tail jitter |
-| `satellite` | 600 ms | 50 ms | 0.5% | 10 Mbps | Gilbert-Elliot | LEO satellite |
-| `congested` | 200 ms | 50 ms | 3% | 1 Mbps | Gilbert-Elliot | Bufferbloat / heavy congestion |
-| `5qi_7` | 100 ms | 10 ms | 0.1% | -- | correlated | 5QI 7: voice / live streaming |
-| `5qi_80` | 10 ms | 1 ms | 0.0001% | -- | correlated | 5QI 80: low-latency eMBB/AR |
+| Profile | Delay | Jitter | Delay Dist. | Loss | Loss Distribution | Rate | Description |
+|:--------|:------|:-------|:------------|:-----|:------------------|:-----|:------------|
+| `no_emulation` | 0 ms | 0 ms | fixed | 0% | -- | -- | Reference (no tc/netem applied) |
+| `6g_itu_hrllc` | 1 ms | 0.2 ms | normal | 0.001% | correlated (10%) | 300 Mbps | 6G HRLLC (ITU IMT-2030 / M.2160) |
+| `5g_urban` | 20 ms | 5 ms | normal | 0.1% | correlated (25%) | 100 Mbps | Mainstream urban terrestrial cellular |
+| `wifi_good` | 30 ms | 10 ms | normal | 0.1% | correlated (30%) | 50 Mbps | Non-3GPP local access (WiFi avg) |
+| `cell_edge` | 120 ms | 30 ms | paretonormal | 1% | Gilbert-Elliot (35%) | 5 Mbps | Weak radio, heavy-tail jitter |
+| `satellite_leo` ⇄ | 22 ms / 22 ms | 7 ms / 8 ms | normal | 0.5% / 0.8% | correlated (40% / 45%) | 100 / 15 Mbps | LEO satellite (asymmetric UL) |
+| `satellite_geo` ⇄ | 340 ms / 340 ms | 15 ms / 18 ms | normal | 0.1% / 0.2% | correlated (20% / 25%) | 50 / 3 Mbps | GEO satellite (long RTT, asymmetric UL) |
+| `congested` | 200 ms | 50 ms | pareto | 3% | Gilbert-Elliot (40%) | 1 Mbps | Bufferbloat / heavy congestion |
+| `5qi_7` | 80 ms | 10 ms | normal | 0.1% | correlated (20%) | -- | 5QI 7: Voice / Live Streaming (PDB 100 ms, PER 1e-3) |
+| `5qi_80` | 8 ms | 1 ms | normal | 1e-6 | correlated (5%) | -- | 5QI 80: Low-latency eMBB / AR (PDB 10 ms, PER 1e-6) |
 
-Profiles include advanced netem controls: `delay_distribution`, `loss_correlation_pct`, `reorder_pct`, `duplicate_pct`, and `limit_packets`. See `configs/profiles.yaml` for full definitions.
+⇄ Asymmetric profiles (`satellite_leo`, `satellite_geo`) use an optional `uplink:` sub-block that overrides egress-side fields only. The columns above show **downlink / uplink**; fields not listed under `uplink:` are inherited from the downlink block. 5QI anchors follow the S4-260848 rule `delay_ms = PDB − 2.054 × jitter_ms` when `jitter_ms > 0`.
+
+Profiles also carry advanced netem controls: `loss_correlation_pct`, `reorder_pct`, `reorder_correlation_pct`, `duplicate_pct`, and `limit_packets`. See `configs/profiles.yaml` for full definitions.
 
 Bidirectional shaping is applied by default using IFB devices:
 
@@ -119,8 +248,8 @@ python orchestrator.py --scenario chat_basic --profile cell_edge
 # Egress-only
 python orchestrator.py --scenario chat_basic --profile cell_edge --egress-only
 
-# Asymmetric
-python orchestrator.py --scenario chat_basic --profile 5g_urban --ingress-profile satellite
+# Asymmetric (e.g. terrestrial DL with LEO UL)
+python orchestrator.py --scenario chat_basic --profile 5g_urban --ingress-profile satellite_leo
 ```
 
 ## Test Matrix
@@ -208,9 +337,9 @@ All MCP servers support HTTP transport for traffic measurement via loopback (sub
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      LLM Client Layer                           │
-│  ┌────────┬────────┬──────────┬──────┬───────────┬───────────┐  │
-│  │ OpenAI │ Gemini │ DeepSeek │ vLLM │ Azure OAI │ Azure Inf │  │
-│  └────────┴────────┴──────────┴──────┴───────────┴───────────┘  │
+│       ┌────────┬────────┬──────────┬──────┐                     │
+│       │ OpenAI │ Gemini │ DeepSeek │ vLLM │                     │
+│       └────────┴────────┴──────────┴──────┘                     │
 └─────────────────────────┬───────────────────────────────────────┘
                           │ HTTPS / WebSocket / WebRTC
                           ▼
@@ -288,13 +417,59 @@ sudo chmod 440 /etc/sudoers.d/testbed
 
 ### vLLM (Self-Hosted Models)
 
+Two ways to run the vLLM server. **Docker is recommended** — the
+`vllm/vllm-openai` image bundles the right CUDA runtime and Python, so it
+sidesteps `libcudart.so.12` and Python-version compatibility issues typical
+of a host-pip install.
+
+#### Docker (recommended)
+
+Requires Docker, the NVIDIA driver, and `nvidia-container-toolkit`. Add
+yourself to the `docker` group so you can manage containers without `sudo`:
+
+```bash
+sudo usermod -aG docker $USER
+newgrp docker                     # or log out / log back in
+
+# Sanity-check GPU passthrough before running scenarios:
+docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi
+```
+
+Launch the vLLM server:
+
+```bash
+docker run -d --name vllm-testbed --gpus all --ipc=host \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -p 127.0.0.1:8000:8000 \
+    vllm/vllm-openai:latest \
+    --model Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --max-model-len 32768 --gpu-memory-utilization 0.95 \
+    --trust-remote-code --tensor-parallel-size 1
+
+# Stop / remove when done:
+docker stop vllm-testbed && docker rm vllm-testbed
+```
+
+Then run the testbed with `MANAGE_VLLM=false` so the scripts probe the
+already-running container instead of trying to spawn another:
+
+```bash
+MANAGE_VLLM=false ./run_full_tests.sh
+MANAGE_VLLM=false ./test_vllm.sh
+```
+
+#### Host pip install (fallback — auto-managed by the scripts)
+
 ```bash
 pip install vllm
 vllm serve Qwen/Qwen3-VL-30B-A3B-Instruct \
     --host 0.0.0.0 --port 8000 \
     --tensor-parallel-size 1 --max-model-len 32768 \
-    --gpu-memory-utilization 0.90 --trust-remote-code
+    --gpu-memory-utilization 0.95 --trust-remote-code
 ```
+
+`run_full_tests.sh` and `test_vllm.sh` default to `MANAGE_VLLM=true`, which
+auto-starts and stops a host `vllm serve` process for you.
 
 vLLM scenarios use `network_interface: lo` to shape loopback traffic.
 

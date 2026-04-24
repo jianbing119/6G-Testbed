@@ -108,6 +108,42 @@ class BaseScenario(ABC):
         """Generate a unique session ID."""
         return str(uuid.uuid4())
 
+    # ------------------------------------------------------------------
+    # Inter-prompt delay (configurable per-scenario "think time")
+    # ------------------------------------------------------------------
+    #
+    # Without a gap, multi-prompt scenarios fire the next request the
+    # instant the previous response lands — observed inter-arrival is
+    # dominated by model/network latency, not realistic user behaviour.
+    # Setting `inter_prompt_delay_sec` on a scenario inserts a pause
+    # *between* prompts (never before the first one).
+    #
+    # Units: seconds (float). 0 (default) disables the delay entirely.
+
+    def _inter_prompt_delay_sec(self) -> float:
+        try:
+            return float(self.config.get("inter_prompt_delay_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _wait_between_prompts(self, turn_index: int) -> None:
+        """Sync sleep between prompts. No-op on turn 0 or when delay <= 0."""
+        if turn_index <= 0:
+            return
+        delay = self._inter_prompt_delay_sec()
+        if delay > 0:
+            import time as _t
+            _t.sleep(delay)
+
+    async def _wait_between_prompts_async(self, turn_index: int) -> None:
+        """Async sleep between prompts. No-op on turn 0 or when delay <= 0."""
+        if turn_index <= 0:
+            return
+        delay = self._inter_prompt_delay_sec()
+        if delay > 0:
+            import asyncio as _a
+            await _a.sleep(delay)
+
     def _create_log_record(
         self,
         session_id: str,

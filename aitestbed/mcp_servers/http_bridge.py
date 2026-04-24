@@ -52,12 +52,45 @@ class _StdioProxy:
         )
         self._lock = threading.Lock()
 
+        # Drain stderr in a background thread so the subprocess never
+        # blocks on a full stderr pipe (some MCP servers are chatty).
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, daemon=True
+        )
+        self._stderr_thread.start()
+
+    def _drain_stderr(self):
+        try:
+            for line in iter(self._proc.stderr.readline, b""):
+                # Forward to our own stderr so operators can see server logs
+                sys.stderr.write(line.decode(errors="replace"))
+                sys.stderr.flush()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_response(msg: dict) -> bool:
+        """A JSON-RPC response carries ``result`` or ``error`` and no ``method``.
+
+        Messages with a ``method`` field are requests or notifications from
+        the server (e.g. log events, progress updates) that must be skipped
+        — they are not responses to our outbound request.
+        """
+        if not isinstance(msg, dict):
+            return False
+        if "method" in msg:
+            return False
+        return "result" in msg or "error" in msg
+
     def send(self, request: dict) -> dict | None:
         """Send a JSON-RPC request/notification and return the response.
 
         For notifications (no ``id``), the subprocess may not send a
         response.  We detect this by the absence of ``id`` and return
         ``None`` immediately after writing.
+
+        Server-initiated notifications (``method`` field) that arrive
+        interleaved with responses are skipped.
         """
         data = json.dumps(request) + "\n"
         encoded = data.encode()
@@ -70,10 +103,34 @@ class _StdioProxy:
             if "id" not in request:
                 return None
 
-            line = self._proc.stdout.readline()
-            if not line:
-                raise RuntimeError("Wrapped MCP server closed stdout")
-            return json.loads(line.decode())
+            request_id = request.get("id")
+
+            # Read lines until we get a genuine response. Skip any
+            # server-initiated notifications (log events, etc.) that
+            # arrive on stdout between requests.
+            while True:
+                line = self._proc.stdout.readline()
+                if not line:
+                    raise RuntimeError("Wrapped MCP server closed stdout")
+                try:
+                    msg = json.loads(line.decode())
+                except json.JSONDecodeError:
+                    # Non-JSON line (plain log output from the server) —
+                    # forward to stderr and keep reading.
+                    sys.stderr.write(line.decode(errors="replace"))
+                    sys.stderr.flush()
+                    continue
+
+                if not self._is_response(msg):
+                    # Server-initiated notification/request — ignore.
+                    continue
+
+                # Prefer matching by id when present, but accept any
+                # response if the server omits ids.
+                msg_id = msg.get("id")
+                if msg_id is None or msg_id == request_id:
+                    return msg
+                # Mismatched id — skip and keep reading.
 
     def close(self):
         try:
@@ -98,6 +155,7 @@ def main_http(wrapped_cmd: list[str], host: str = "127.0.0.1", port: int = 0):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
+            request = None
             try:
                 request = json.loads(body)
                 response = proxy.send(request)
@@ -121,6 +179,24 @@ def main_http(wrapped_cmd: list[str], host: str = "127.0.0.1", port: int = 0):
                 }
                 payload = json.dumps(error_resp).encode()
                 self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as exc:
+                # Covers RuntimeError("Wrapped MCP server closed stdout")
+                # and any other transport failures. Return a proper
+                # JSON-RPC error instead of dropping the connection.
+                error_resp = {
+                    "jsonrpc": "2.0",
+                    "id": request.get("id") if isinstance(request, dict) else None,
+                    "error": {
+                        "code": -32000,
+                        "message": f"Bridge error: {exc}",
+                    },
+                }
+                payload = json.dumps(error_resp).encode()
+                self.send_response(500)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()

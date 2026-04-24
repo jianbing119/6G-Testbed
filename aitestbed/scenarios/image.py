@@ -50,6 +50,7 @@ class ImageGenerationScenario(BaseScenario):
 
         try:
             for turn_index, prompt in enumerate(prompts):
+                self._wait_between_prompts(turn_index)
                 t_request_start = time.time()
 
                 try:

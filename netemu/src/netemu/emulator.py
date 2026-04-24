@@ -846,6 +846,15 @@ class NetworkEmulator:
         if not netem_params:
             return True
 
+        # 0) Defensive clear: any stale root qdisc on lo (e.g. from a prior
+        # run whose scenario thread was killed by the run-timeout and still
+        # holds the qdisc, or from a crashed previous invocation) would cause
+        # the `add` below to fail with "Exclusivity flag on, cannot modify".
+        # A delete is idempotent and cheap.
+        self._run_tc_command(
+            "sudo tc qdisc del dev lo root", ignore_errors=True
+        )
+
         # 1) prio qdisc on lo with 3 bands
         if not self._run_tc_command(
             "sudo tc qdisc add dev lo root handle 1: prio bands 3"

@@ -16,6 +16,8 @@ websockets>=12.0  # For OpenAI Realtime API
 # Data Processing
 pandas>=2.0.0
 pyarrow>=14.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0  # Excel export backend for pandas.ExcelWriter
 
 # Visualization
 matplotlib>=3.7.0
@@ -40,6 +42,7 @@ dpkt>=1.9.8
 
 # Optional: WebRTC transport for realtime scenarios
 aiortc>=1.5.0
+av>=10.0.0  # PyAV — audio frame handling / resampling for WebRTC realtime client
 
 # Optional: Computer use executor
 playwright>=1.41.0
@@ -48,6 +51,7 @@ playwright>=1.41.0
 # Some MCP servers are npm packages, others are Python packages.
 # Install npm-based servers: npm install -g @modelcontextprotocol/server-brave-search
 # The Python MCP client uses subprocess to communicate with MCP servers.
+mcp>=1.0.0              # Python MCP client SDK (mcp.types, protocol constants)
 mcp-server-fetch>=2025.0.0
 
 # Optional: Alpaca market data MCP server

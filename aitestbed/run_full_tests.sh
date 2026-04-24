@@ -20,7 +20,7 @@ if [[ -f ".env" ]]; then
 fi
 
 # Configuration
-RUNS_PER_SCENARIO=${RUNS_PER_SCENARIO:-30}
+RUNS_PER_SCENARIO=${RUNS_PER_SCENARIO:-10}
 INTER_SCENARIO_DELAY=${INTER_SCENARIO_DELAY:-2}  # Seconds between scenarios
 INTER_PROVIDER_DELAY=${INTER_PROVIDER_DELAY:-5}  # Seconds between providers
 TRACE_PAYLOADS=${TRACE_PAYLOADS:-1}
@@ -28,10 +28,12 @@ TRACE_LOG_DIR=${TRACE_LOG_DIR:-logs/traces}
 CAPTURE_PCAP=${CAPTURE_PCAP:-true}  # Enable L3/L4 packet capture by default
 CAPTURE_DIR=${CAPTURE_DIR:-results/captures}
 CAPTURE_FILTER=${CAPTURE_FILTER:-"port 443 or port 80 or port 8080 or port 8000"}  # HTTPS, HTTP, proxy, and vLLM
+CAPTURE_LOOPBACK=${CAPTURE_LOOPBACK:-true}  # Secondary tcpdump on lo for MCP-over-HTTP frames
+MCP_TRANSPORT=${MCP_TRANSPORT:-http}  # MCP server transport: http (default, netem-shaped) or stdio
 ANONYMIZE_DB=${ANONYMIZE_DB:-true}  # Anonymize provider/model names by default
 CLEAN_START=${CLEAN_START:-true}  # Start from a clean database by default
 NETWORK_INTERFACE=${NETWORK_INTERFACE:-auto}  # Network interface for emulation + capture (auto = detect)
-RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-600}  # Per-run timeout in seconds (0 = no timeout)
+RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-600}  # Per-run timeout in seconds (0 = no timeout). 600s = head-room for streaming multi-prompt chat (deepseek-coder, deepseek-reasoner).
 STOP_ON_ERROR=${STOP_ON_ERROR:-true}  # Stop on first failed run (default: true)
 RESUME_MODE=${RESUME_MODE:-false}  # Resume from last successful run
 QUIET_MODE=${QUIET_MODE:-true}  # Show progress bar instead of verbose output
@@ -103,6 +105,34 @@ HAS_SPOTIFY=false
 HAS_ALPACA=false
 HAS_VLLM=false
 RUN_STRESS_TESTS=false
+
+# vLLM lifecycle. When MANAGE_VLLM=true (default), this script starts vllm
+# before the vllm phase and stops it on exit (including INT/TERM/error).
+# Set MANAGE_VLLM=false to skip auto-management — useful when an operator
+# already runs a long-lived vllm server independently and the script should
+# only probe reachability. The managed server stays loaded across the whole
+# run; if one is already up at ${VLLM_HOST}:${VLLM_PORT}, it is reused.
+#
+# VLLM_BACKEND selects how the server is launched:
+#   docker (default)  — runs vllm/vllm-openai container; needs docker + nvidia-container-toolkit
+#   host              — spawns `vllm serve` directly; needs `vllm` on PATH and working CUDA
+MANAGE_VLLM=${MANAGE_VLLM:-true}
+VLLM_BACKEND=${VLLM_BACKEND:-docker}
+VLLM_MODEL=${VLLM_MODEL:-Qwen/Qwen3-VL-30B-A3B-Instruct}
+VLLM_HOST=${VLLM_HOST:-127.0.0.1}
+VLLM_PORT=${VLLM_PORT:-8000}
+VLLM_GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.95}
+VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}  # 32K context. 128K OOMs KV-cache on single-GPU boxes.
+VLLM_EXTRA_ARGS=${VLLM_EXTRA_ARGS:---trust-remote-code --tensor-parallel-size 1}
+VLLM_LOG=${VLLM_LOG:-logs/vllm_server.log}
+VLLM_PID_FILE=${VLLM_PID_FILE:-logs/vllm_server.pid}
+VLLM_STARTUP_TIMEOUT_SEC=${VLLM_STARTUP_TIMEOUT_SEC:-600}
+VLLM_SHUTDOWN_TIMEOUT_SEC=${VLLM_SHUTDOWN_TIMEOUT_SEC:-30}
+VLLM_STARTED_BY_US=false
+# Docker backend knobs
+VLLM_IMAGE=${VLLM_IMAGE:-vllm/vllm-openai:latest}
+VLLM_CONTAINER_NAME=${VLLM_CONTAINER_NAME:-vllm-testbed}
+VLLM_HF_CACHE=${VLLM_HF_CACHE:-$HOME/.cache/huggingface}
 
 ALL_PROFILES=()
 TEST_MATRIX_ENTRIES=()
@@ -176,11 +206,20 @@ check_optional_prereqs() {
     fi
 
     # Check vLLM server
-    if curl -sf http://localhost:8000/v1/models > /dev/null 2>&1; then
+    if vllm_reachable; then
         HAS_VLLM=true
-        log_info "  + vLLM server reachable at localhost:8000"
+        log_info "  + vLLM server reachable at ${VLLM_HOST}:${VLLM_PORT}"
     else
-        log_warn "  - vLLM server not reachable (start with: docker run ... vllm/vllm-openai)"
+        log_warn "  - vLLM server not reachable at ${VLLM_HOST}:${VLLM_PORT}"
+        if [[ "$MANAGE_VLLM" == "true" ]]; then
+            # Auto-management is on but the server didn't come up — most
+            # likely the vllm phase is disabled, so start_vllm_server was
+            # skipped. vllm scenarios will be skipped by the prereq check.
+            log_warn "    (MANAGE_VLLM=true but the vllm phase is disabled, so no server was started)"
+        else
+            log_warn "    Start it manually (vllm serve ${VLLM_MODEL} --host ${VLLM_HOST} --port ${VLLM_PORT} ...)"
+            log_warn "    or unset MANAGE_VLLM=false to let this script auto-start it"
+        fi
     fi
 
     log_warn "  - Azure scenarios disabled in this runner"
@@ -277,6 +316,103 @@ PY
     PROGRESS_DONE=0
 }
 
+# Filter out already-completed scenario/profile combos from the test matrix.
+# Only useful in resume mode — queries the DB once up front so the main loop
+# never even sees entries that have nothing left to run.
+filter_completed_from_matrix() {
+    local db="logs/traffic_logs.db"
+    if [[ ! -f "$db" ]]; then
+        return
+    fi
+
+    local original_count=${#TEST_MATRIX_ENTRIES[@]}
+    local filtered=()
+
+    # Build a lookup of completed counts: "scenario|profile" -> count
+    # Single DB query for all combos.
+    declare -A completed_counts
+    while IFS=$'\t' read -r scenario profile count; do
+        completed_counts["${scenario}|${profile}"]=$count
+    done < <(
+        python - "$db" "$RUNS_PER_SCENARIO" <<'PY'
+import sqlite3, sys
+
+db_path, runs_needed = sys.argv[1], int(sys.argv[2])
+try:
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("""
+        SELECT scenario_id, network_profile, COUNT(DISTINCT session_id)
+        FROM traffic_logs
+        WHERE session_id NOT LIKE 'pcap_%'
+          AND (
+              session_id LIKE 'timeout_%'
+              OR session_id NOT IN (
+                  SELECT DISTINCT session_id FROM traffic_logs
+                  WHERE success = 0
+              )
+          )
+        GROUP BY scenario_id, network_profile
+    """).fetchall()
+    for scenario, profile, count in rows:
+        print(f"{scenario}\t{profile}\t{count}")
+except Exception:
+    pass
+PY
+    )
+
+    local skipped_combos=0
+    local skipped_entries=0
+
+    for entry in "${TEST_MATRIX_ENTRIES[@]}"; do
+        local phase scenario runner_enabled scenario_disabled profiles_csv prereqs_csv
+        IFS=$'\t' read -r phase scenario runner_enabled scenario_disabled profiles_csv prereqs_csv <<< "$entry"
+
+        IFS=',' read -r -a profiles <<< "$profiles_csv"
+        local remaining=()
+        for profile in "${profiles[@]}"; do
+            local key="${scenario}|${profile}"
+            local done=${completed_counts[$key]:-0}
+            if [[ "$done" -ge "$RUNS_PER_SCENARIO" ]]; then
+                skipped_combos=$(( skipped_combos + 1 ))
+            else
+                remaining+=("$profile")
+            fi
+        done
+
+        if [[ ${#remaining[@]} -eq 0 ]]; then
+            skipped_entries=$(( skipped_entries + 1 ))
+            continue
+        fi
+
+        # Rebuild entry with only the remaining profiles
+        local new_profiles_csv
+        new_profiles_csv=$(IFS=','; echo "${remaining[*]}")
+        filtered+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s' \
+            "$phase" "$scenario" "$runner_enabled" "$scenario_disabled" \
+            "$new_profiles_csv" "$prereqs_csv")")
+    done
+
+    TEST_MATRIX_ENTRIES=("${filtered[@]}")
+
+    # Recount progress total
+    PROGRESS_TOTAL=0
+    for entry in "${TEST_MATRIX_ENTRIES[@]}"; do
+        local _phase _scenario _runner_enabled _scenario_disabled _profiles_csv _prereqs_csv
+        IFS=$'\t' read -r _phase _scenario _runner_enabled _scenario_disabled _profiles_csv _prereqs_csv <<< "$entry"
+        local _skip
+        _skip=$(entry_skip_reason "$_phase" "$_scenario" "$_runner_enabled" "$_scenario_disabled" "$_prereqs_csv" || true)
+        if [[ -z "$_skip" ]] && phase_enabled "$_phase"; then
+            IFS=',' read -r -a _profiles <<< "$_profiles_csv"
+            PROGRESS_TOTAL=$(( PROGRESS_TOTAL + ${#_profiles[@]} ))
+        fi
+    done
+
+    if [[ "$skipped_combos" -gt 0 ]]; then
+        log_info "Resume: $skipped_combos scenario/profile combos already completed, $skipped_entries entries fully done"
+        log_info "Resume: ${#TEST_MATRIX_ENTRIES[@]} entries remaining (from $original_count)"
+    fi
+}
+
 # Check sudo access for tc
 check_sudo() {
     log_info "Checking sudo access for network emulation..."
@@ -307,7 +443,312 @@ cleanup_network_state() {
 }
 
 cleanup_on_exit() {
+    # vLLM teardown first — kill the server before tearing down lo qdiscs
+    # so its workers see a clean loopback during shutdown.
+    stop_vllm_server || true
     cleanup_network_state "${LAST_INTERFACE:-}"
+}
+
+# ---------------------------------------------------------------------------
+# vLLM server lifecycle
+# ---------------------------------------------------------------------------
+#
+# vllm scenarios target http://${VLLM_HOST}:${VLLM_PORT} on the loopback
+# interface. The orchestrator applies tc/netem to lo *per scenario* via the
+# scenarios.yaml `network_interface: lo` setting, so the server itself sees
+# unshaped lo at startup/shutdown — netem only kicks in while a scenario
+# runs. We therefore clear lo before launching vllm to make sure no stale
+# qdisc from a prior crashed run interferes with model load.
+
+vllm_reachable() {
+    curl -sf "http://${VLLM_HOST}:${VLLM_PORT}/v1/models" > /dev/null 2>&1
+}
+
+start_vllm_server() {
+    # No-op when not in managed mode.
+    if [[ "$MANAGE_VLLM" != "true" ]]; then
+        return 0
+    fi
+
+    # If something is already serving on the port, reuse it. The operator may
+    # have started it themselves and forgotten to unset MANAGE_VLLM.
+    if vllm_reachable; then
+        log_info "vLLM already reachable at ${VLLM_HOST}:${VLLM_PORT} — reusing existing server"
+        HAS_VLLM=true
+        return 0
+    fi
+
+    case "$VLLM_BACKEND" in
+        docker) _start_vllm_docker ;;
+        host)   _start_vllm_host   ;;
+        *)
+            log_error "Unknown VLLM_BACKEND=${VLLM_BACKEND} (expected: docker|host)"
+            return 1
+            ;;
+    esac
+}
+
+_start_vllm_host() {
+    if ! command -v vllm > /dev/null 2>&1; then
+        log_error "VLLM_BACKEND=host but 'vllm' is not on PATH (pip install vllm)"
+        return 1
+    fi
+
+    # Make sure lo is unshaped before vllm initializes its sockets.
+    sudo tc qdisc del dev lo root    >/dev/null 2>&1 || true
+    sudo tc qdisc del dev lo ingress >/dev/null 2>&1 || true
+
+    mkdir -p "$(dirname "$VLLM_LOG")"
+    : > "$VLLM_LOG"
+
+    log_info "Starting vLLM (host): model=${VLLM_MODEL} host=${VLLM_HOST} port=${VLLM_PORT}"
+    log_info "  log: $VLLM_LOG  (timeout ${VLLM_STARTUP_TIMEOUT_SEC}s for model load)"
+
+    # setsid puts vllm in its own process group so we can SIGTERM the whole
+    # tree (vllm spawns worker procs) on shutdown.
+    setsid vllm serve "$VLLM_MODEL" \
+        --host "$VLLM_HOST" \
+        --port "$VLLM_PORT" \
+        --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
+        --max-model-len "$VLLM_MAX_MODEL_LEN" \
+        $VLLM_EXTRA_ARGS \
+        > "$VLLM_LOG" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$VLLM_PID_FILE"
+    VLLM_STARTED_BY_US=true
+
+    local waited=0
+    while (( waited < VLLM_STARTUP_TIMEOUT_SEC )); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_error "vLLM exited during startup (pid $pid). Tail of $VLLM_LOG:"
+            tail -n 40 "$VLLM_LOG" | sed 's/^/    /' >&2 || true
+            rm -f "$VLLM_PID_FILE"
+            VLLM_STARTED_BY_US=false
+            return 1
+        fi
+        if vllm_reachable; then
+            log_info "vLLM ready at ${VLLM_HOST}:${VLLM_PORT} (pid $pid, ${waited}s)"
+            HAS_VLLM=true
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        if (( waited % 30 == 0 )); then
+            log_info "  still waiting for vLLM (${waited}s / ${VLLM_STARTUP_TIMEOUT_SEC}s)..."
+        fi
+    done
+
+    log_error "vLLM did not become ready within ${VLLM_STARTUP_TIMEOUT_SEC}s. Tail of $VLLM_LOG:"
+    tail -n 40 "$VLLM_LOG" | sed 's/^/    /' >&2 || true
+    stop_vllm_server || true
+    return 1
+}
+
+_start_vllm_docker() {
+    # Preflight
+    if ! command -v docker > /dev/null 2>&1; then
+        log_error "VLLM_BACKEND=docker but 'docker' is not on PATH"
+        return 1
+    fi
+    if ! docker info > /dev/null 2>&1; then
+        log_error "Cannot access the Docker daemon (is it running? are you in the 'docker' group?)"
+        log_error "  Fix: sudo usermod -aG docker \$USER && newgrp docker"
+        return 1
+    fi
+
+    # Adopt or clean up any existing container with the same name.
+    local existing_status
+    existing_status=$(docker inspect -f '{{.State.Status}}' "$VLLM_CONTAINER_NAME" 2>/dev/null || echo "")
+    if [[ "$existing_status" == "running" ]]; then
+        log_info "Adopting already-running container '${VLLM_CONTAINER_NAME}'"
+        VLLM_STARTED_BY_US=true
+    elif [[ -n "$existing_status" ]]; then
+        log_info "Removing stale container '${VLLM_CONTAINER_NAME}' (status=${existing_status})"
+        docker rm -f "$VLLM_CONTAINER_NAME" > /dev/null 2>&1 || true
+        existing_status=""
+    fi
+
+    if [[ "$existing_status" != "running" ]]; then
+        # Unshape lo before container-side socket setup.
+        sudo tc qdisc del dev lo root    >/dev/null 2>&1 || true
+        sudo tc qdisc del dev lo ingress >/dev/null 2>&1 || true
+
+        mkdir -p "$(dirname "$VLLM_LOG")"
+        : > "$VLLM_LOG"
+
+        # Ensure the HF cache mount target exists on the host — docker will
+        # create it if missing, but if your Docker install is rootless or
+        # the parent perms are odd the mount will fail silently.
+        mkdir -p "$VLLM_HF_CACHE" 2>/dev/null || true
+
+        log_info "Starting vLLM (docker): image=${VLLM_IMAGE} name=${VLLM_CONTAINER_NAME}"
+        log_info "  model=${VLLM_MODEL}  bind=${VLLM_HOST}:${VLLM_PORT}  HF cache=${VLLM_HF_CACHE}"
+        log_info "  log: $VLLM_LOG  (timeout ${VLLM_STARTUP_TIMEOUT_SEC}s for model load)"
+
+        # Capture stdout (container ID) and stderr (errors / image-pull progress)
+        # separately, and mirror stderr to $VLLM_LOG so pull/config errors are
+        # visible instead of scrolling off.
+        local _stderr_file cid rc
+        _stderr_file=$(mktemp -t vllm-run-err.XXXXXX)
+        cid=$(docker run -d --name "$VLLM_CONTAINER_NAME" \
+                --gpus all --ipc=host \
+                -v "${VLLM_HF_CACHE}:/root/.cache/huggingface" \
+                -p "${VLLM_HOST}:${VLLM_PORT}:8000" \
+                "$VLLM_IMAGE" \
+                --model "$VLLM_MODEL" \
+                --max-model-len "$VLLM_MAX_MODEL_LEN" \
+                --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
+                $VLLM_EXTRA_ARGS 2>"$_stderr_file")
+        rc=$?
+        # Fold stderr into the persistent log for later triage
+        if [[ -s "$_stderr_file" ]]; then
+            {
+                echo "=== docker run stderr ==="
+                cat "$_stderr_file"
+                echo "=== end docker run stderr ==="
+            } >> "$VLLM_LOG"
+        fi
+
+        if [[ "$rc" -ne 0 ]]; then
+            log_error "docker run failed (rc=$rc). stderr:"
+            sed 's/^/    /' "$_stderr_file" >&2 || true
+            rm -f "$_stderr_file"
+            # Clean up any half-created container so the next attempt adopts nothing stale
+            docker rm -f "$VLLM_CONTAINER_NAME" >/dev/null 2>&1 || true
+            return 1
+        fi
+        rm -f "$_stderr_file"
+
+        if [[ -z "$cid" ]]; then
+            log_error "docker run returned success but no container ID. Check Docker daemon."
+            return 1
+        fi
+        log_info "Container started (id=${cid:0:12})"
+
+        # Paranoia: verify the container is actually registered before we enter
+        # the wait loop. If docker_proxy / daemon bridged the run but the
+        # container vanished instantly, surface that now rather than 5 minutes later.
+        if ! docker inspect "$VLLM_CONTAINER_NAME" >/dev/null 2>&1; then
+            log_error "Container '${VLLM_CONTAINER_NAME}' not registered after docker run. "
+            log_error "  Dumping last 40 lines of docker events for this container:"
+            docker events --filter "container=${cid}" --since "1m" --until "0s" 2>&1 | tail -40 | sed 's/^/    /' >&2 || true
+            return 1
+        fi
+        VLLM_STARTED_BY_US=true
+    fi
+
+    # Wait for /v1/models to respond. Also fail fast if the container dies.
+    local waited=0
+    while (( waited < VLLM_STARTUP_TIMEOUT_SEC )); do
+        if ! docker inspect -f '{{.State.Running}}' "$VLLM_CONTAINER_NAME" 2>/dev/null | grep -q '^true$'; then
+            _dump_vllm_container_diagnostics
+            return 1
+        fi
+        if vllm_reachable; then
+            log_info "vLLM ready at ${VLLM_HOST}:${VLLM_PORT} (container ${VLLM_CONTAINER_NAME}, ${waited}s)"
+            # Snapshot startup logs so the operator can tail $VLLM_LOG later
+            # (live tail: `docker logs -f ${VLLM_CONTAINER_NAME}`)
+            docker logs --tail 100 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
+            HAS_VLLM=true
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        if (( waited % 30 == 0 )); then
+            log_info "  still waiting for vLLM container (${waited}s / ${VLLM_STARTUP_TIMEOUT_SEC}s)..."
+        fi
+    done
+
+    log_error "vLLM container did not become ready within ${VLLM_STARTUP_TIMEOUT_SEC}s."
+    _dump_vllm_container_diagnostics
+    stop_vllm_server || true
+    return 1
+}
+
+# Dump docker-side diagnostics for a vllm container that failed to come up.
+# Shows State (running/exited/dead), ExitCode, OOMKilled, Error, and last 40
+# log lines — or a clear "container does not exist" message if it vanished.
+_dump_vllm_container_diagnostics() {
+    if ! docker inspect "$VLLM_CONTAINER_NAME" >/dev/null 2>&1; then
+        log_error "Container '${VLLM_CONTAINER_NAME}' no longer exists."
+        log_error "  Most common causes:"
+        log_error "    - docker run rejected by the daemon (check preceding stderr)"
+        log_error "    - container was --rm'd elsewhere, or system OOM reaped it"
+        log_error "    - '\$VLLM_CONTAINER_NAME' is in use by another testbed; try: docker ps -a"
+        return
+    fi
+
+    log_error "Container '${VLLM_CONTAINER_NAME}' state:"
+    docker inspect -f $'    status={{.State.Status}}  exit_code={{.State.ExitCode}}  oom={{.State.OOMKilled}}\n    error={{.State.Error}}\n    started_at={{.State.StartedAt}}  finished_at={{.State.FinishedAt}}' \
+        "$VLLM_CONTAINER_NAME" 2>&1 >&2 || true
+
+    log_error "  Tail of docker logs (40 lines):"
+    docker logs --tail 40 "$VLLM_CONTAINER_NAME" 2>&1 | sed 's/^/    /' >&2 || true
+    # Snapshot full log for post-mortem
+    docker logs --tail 500 "$VLLM_CONTAINER_NAME" > "$VLLM_LOG" 2>&1 || true
+}
+
+stop_vllm_server() {
+    if [[ "$VLLM_STARTED_BY_US" != "true" ]]; then
+        return 0
+    fi
+    case "$VLLM_BACKEND" in
+        docker) _stop_vllm_docker ;;
+        host)   _stop_vllm_host   ;;
+    esac
+    VLLM_STARTED_BY_US=false
+}
+
+_stop_vllm_docker() {
+    if ! docker inspect "$VLLM_CONTAINER_NAME" > /dev/null 2>&1; then
+        return 0
+    fi
+    log_info "Stopping vLLM container '${VLLM_CONTAINER_NAME}' (timeout ${VLLM_SHUTDOWN_TIMEOUT_SEC}s)..."
+    # Save final logs — but only if $VLLM_LOG doesn't already contain the
+    # crash dump from _dump_vllm_container_diagnostics. Otherwise we'd wipe
+    # it. We snapshot to a side file regardless so nothing is lost.
+    docker logs --tail 500 "$VLLM_CONTAINER_NAME" > "${VLLM_LOG}.final" 2>&1 || true
+    if [[ ! -s "$VLLM_LOG" ]]; then
+        cp "${VLLM_LOG}.final" "$VLLM_LOG" 2>/dev/null || true
+    fi
+    if docker stop --time "$VLLM_SHUTDOWN_TIMEOUT_SEC" "$VLLM_CONTAINER_NAME" > /dev/null 2>&1; then
+        log_info "vLLM container stopped cleanly"
+    else
+        log_warn "docker stop didn't complete cleanly — sending SIGKILL"
+        docker kill "$VLLM_CONTAINER_NAME" > /dev/null 2>&1 || true
+    fi
+    docker rm "$VLLM_CONTAINER_NAME" > /dev/null 2>&1 || true
+}
+
+_stop_vllm_host() {
+    if [[ ! -f "$VLLM_PID_FILE" ]]; then
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$VLLM_PID_FILE" 2>/dev/null || true)
+    rm -f "$VLLM_PID_FILE"
+
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    log_info "Stopping vLLM (pid $pid, group $pid)..."
+    # SIGTERM the whole process group so vllm workers exit too.
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+
+    local waited=0
+    while (( waited < VLLM_SHUTDOWN_TIMEOUT_SEC )); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_info "vLLM stopped cleanly after ${waited}s"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    log_warn "vLLM did not exit within ${VLLM_SHUTDOWN_TIMEOUT_SEC}s — sending SIGKILL"
+    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
 }
 
 # Helper: query sqlite via Python (no sqlite3 CLI dependency)
@@ -437,6 +878,9 @@ prereq_satisfied() {
         http://localhost:8000/v1/models)
             [[ "$HAS_VLLM" == "true" ]]
             ;;
+        cmd:*)
+            command -v "${prereq#cmd:}" > /dev/null 2>&1
+            ;;
         http://*|https://*)
             curl -sf "$prereq" > /dev/null 2>&1
             ;;
@@ -491,7 +935,10 @@ entry_skip_reason() {
     return 1
 }
 
-# Run a single scenario with all its profiles
+# Run a single scenario with all its profiles.
+# Sets LAST_SCENARIO_DID_WORK=true if any profile actually ran tests.
+LAST_SCENARIO_DID_WORK=false
+
 run_scenario() {
     local scenario=$1
     shift
@@ -502,6 +949,7 @@ run_scenario() {
     local logfile=""
     local exit_code=0
     local failure_detail=""
+    local scenario_did_work=false
 
     if [[ "$NETWORK_INTERFACE" == "auto" ]]; then
         interface_override=$(get_scenario_config_value "$scenario" "network_interface" || true)
@@ -529,12 +977,22 @@ run_scenario() {
             --scenario $scenario \
             --profile $profile \
             --runs $RUNS_PER_SCENARIO \
-            --interface $scenario_interface"
+            --interface $scenario_interface \
+            --mcp-transport $MCP_TRANSPORT"
 
         if [[ "$CAPTURE_PCAP" == "true" ]]; then
             cmd="$cmd --capture-pcap --capture-dir $CAPTURE_DIR"
             if [[ -n "$CAPTURE_FILTER" ]]; then
                 cmd="$cmd --capture-filter '$CAPTURE_FILTER'"
+            fi
+            # Secondary loopback capture so MCP JSON-RPC frames (which traverse
+            # http://127.0.0.1 between agent and MCP server) are visible in pcap.
+            # Skipped automatically by orchestrator.py when the primary
+            # interface is already lo or when --mcp-transport=stdio.
+            if [[ "$CAPTURE_LOOPBACK" == "true" ]]; then
+                cmd="$cmd --capture-loopback"
+            else
+                cmd="$cmd --no-capture-loopback"
             fi
         fi
 
@@ -570,9 +1028,17 @@ run_scenario() {
             return 1
         fi
 
+        # Skip cooldown if the orchestrator skipped all runs (resume mode)
+        if grep -q "all .* runs already completed" "$logfile" 2>/dev/null; then
+            continue
+        fi
+
+        scenario_did_work=true
         log_info "Cooling down for ${INTER_SCENARIO_DELAY}s..."
         sleep "$INTER_SCENARIO_DELAY"
     done
+
+    LAST_SCENARIO_DID_WORK="$scenario_did_work"
 }
 
 run_test_matrix_suite() {
@@ -629,7 +1095,9 @@ run_test_matrix_suite() {
             log_error "Stopping: $scenario failed (use --resume to continue later)"
             return 1
         fi
-        phase_ran=true
+        if [[ "$LAST_SCENARIO_DID_WORK" == "true" ]]; then
+            phase_ran=true
+        fi
     done
 }
 
@@ -697,13 +1165,33 @@ main() {
         echo "Stop on error:     $STOP_ON_ERROR"
         echo "Inter-scenario:    ${INTER_SCENARIO_DELAY}s"
         echo "Inter-provider:    ${INTER_PROVIDER_DELAY}s"
+        if [[ "$MANAGE_VLLM" == "true" ]]; then
+            echo "vLLM:              auto-managed via ${VLLM_BACKEND} (model=${VLLM_MODEL}, bind=${VLLM_HOST}:${VLLM_PORT})"
+        fi
         echo ""
     fi
 
     # Check prerequisites
     check_sudo || true
 
-    # Check optional prerequisites
+    # Register the EXIT/INT/TERM trap *before* starting vLLM so a Ctrl-C
+    # during the (possibly several-minute) model load still triggers
+    # stop_vllm_server via cleanup_on_exit.
+    mkdir -p logs
+    trap cleanup_on_exit EXIT INT TERM
+
+    # Auto-start vLLM if requested AND the vllm phase is not disabled.
+    # (No point loading a 24 GB model just to immediately shut it back down.)
+    if [[ "$MANAGE_VLLM" == "true" ]] && phase_enabled "vllm"; then
+        if ! start_vllm_server; then
+            log_error "vLLM startup failed — aborting (set MANAGE_VLLM=false to skip vllm scenarios instead)"
+            exit 1
+        fi
+    elif [[ "$MANAGE_VLLM" == "true" ]]; then
+        log_info "MANAGE_VLLM=true but vllm phase is disabled — not starting server"
+    fi
+
+    # Check optional prerequisites (now sees the running server, if managed)
     if [[ "$QUIET_MODE" != "true" ]]; then
         check_optional_prereqs
     else
@@ -711,8 +1199,14 @@ main() {
     fi
     load_test_matrix
 
-    mkdir -p logs
-    trap cleanup_on_exit EXIT INT TERM
+    # In resume mode, filter out completed work before doing anything else
+    if [[ "$RESUME_MODE" == "true" ]]; then
+        filter_completed_from_matrix
+        if [[ ${#TEST_MATRIX_ENTRIES[@]} -eq 0 ]]; then
+            log_info "All scenario/profile combos already completed — nothing to do."
+            exit 0
+        fi
+    fi
 
     # Clean start if requested
     if [[ "$CLEAN_START" == "true" ]]; then
@@ -732,16 +1226,18 @@ main() {
     START_TIME=$(date +%s)
 
     # =====================================================
-    # Network Profiles referenced by configs/scenarios.yaml:test_matrix:
-    # - no_emulation: reference case with no tc/netem impairment
-    # - ideal_6g:   1ms delay, 0% loss, unlimited BW (baseline)
-    # - 5g_urban:   20ms delay, 0.1% loss, 100Mbit
-    # - wifi_good:  30ms delay, 0.1% loss, 50Mbit
-    # - cell_edge:  120ms delay, 1% loss, 5Mbit
-    # - satellite:  600ms delay, 0.5% loss, 10Mbit
-    # - congested:  200ms delay, 3% loss, 1Mbit
-    # - 5qi_7:      100ms delay, 0.1% loss (Voice/Live Streaming)
-    # - 5qi_80:     10ms delay, 0.0001% loss (Low-latency eMBB/AR)
+    # Network Profiles referenced by configs/scenarios.yaml:test_matrix
+    # (per S4-260848 Table C.Z-1):
+    # - no_emulation:   reference case with no tc/netem impairment
+    # - 6g_itu_hrllc:   1ms / 0.001% loss / 300Mbit (ITU IMT-2030 HRLLC)
+    # - 5g_urban:       20ms / 0.1% loss / 100Mbit (mainstream cellular)
+    # - wifi_good:      30ms / 0.1% loss / 50Mbit (non-3GPP local access)
+    # - cell_edge:      120ms / 1% loss / 5Mbit (paretonormal jitter, gemodel loss)
+    # - satellite_leo:  ASYMMETRIC — DL 22ms/100Mbit, UL 22ms/15Mbit
+    # - satellite_geo:  ASYMMETRIC — DL 340ms/50Mbit, UL 340ms/3Mbit
+    # - congested:      200ms / 3% loss / 1Mbit (bufferbloat / queue stress)
+    # - 5qi_7:          80ms / 0.1% loss (Voice / Live Streaming, jitter-corrected PDB)
+    # - 5qi_80:         8ms / 0.0001% loss (Low-latency eMBB / AR)
     # =====================================================
 
     if ! run_test_matrix_suite; then
@@ -1087,7 +1583,7 @@ while [[ $# -gt 0 ]]; do
             echo "  ANONYMIZE_DB             Anonymize provider/model names (default: true)"
             echo "  CLEAN_START              Archive old data before starting (default: true)"
             echo "  NETWORK_INTERFACE        Global interface override (default: auto)"
-            echo "  RUN_TIMEOUT_SEC          Per-run timeout in seconds (default: 600, 0 = no timeout)"
+            echo "  RUN_TIMEOUT_SEC          Per-run timeout in seconds (default: 300, 0 = no timeout)"
             echo ""
             echo "Optional API keys (for additional scenarios):"
             echo "  GOOGLE_SEARCH_API_KEY    Enable Google search scenarios"
