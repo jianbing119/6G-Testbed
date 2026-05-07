@@ -8,7 +8,7 @@ import json
 import statistics
 from typing import Optional
 from dataclasses import dataclass, field
-
+import os, glob
 
 @dataclass
 class ScenarioMetrics:
@@ -100,6 +100,13 @@ class ScenarioMetrics:
     burst_off_gap_mean_sec: Optional[float] = None
     burst_on_gap_count: int = 0
     burst_off_gap_count: int = 0
+
+    # task metrics (proactive task in VLM video understanding)
+    task_total: int = 0
+    task_time_correct: int = 0
+    task_answer_correct: int = 0
+    task_time_accuracy: float = 0.0
+    task_answer_accuracy: float = 0.0
 
 
 class MetricsCalculator:
@@ -436,6 +443,136 @@ class MetricsCalculator:
         return metrics
 
     @staticmethod
+    # def load_task_results(src: str, ) -> list[dict]:
+    def load_task_results(src: str, network_profile: str) -> list[dict]:
+        """
+        Load proactive task results from JSON file.
+        Args:
+            src: Path to the data file or directory containing questions_results.json files
+        Returns:
+            List of all question result entries
+        """
+        data = []
+        if os.path.isdir(src):
+            # pattern = os.path.join(src, '**', 'questions_results.json')
+            pattern = os.path.join(src, '**', f'questions_results_{network_profile}.json')
+            json_files = glob.glob(pattern, recursive=True)
+            print(f"Found {len(json_files)} questions_results.json files in {src}")
+            
+            for file_path in json_files:
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_data = json.load(f)
+                        if isinstance(file_data, list):
+                            data.extend(file_data)
+                        else:
+                            data.append(file_data)
+                except Exception as e:
+                    print(f"Error loading {file_path}: {e}")
+        else:
+            with open(src, 'r', encoding='utf-8') as file:
+                data = json.load(file)
+        
+        return data
+
+    @staticmethod
+    def calculate_task_accuracy(
+        data: list[dict],
+        model: str,
+        po_thd: int,
+    ) -> dict[str, dict[str, int | float]]:
+        """
+        Calculate task metrics from VLM video understanding results.      
+        Args:
+            data: List of question result entries (each entry contains 'questions' list)
+            model: Model name to identify the model's answer key
+            po_thd: Proactive output time threshold (in seconds)
+        Returns:
+            Dictionary with stats per task_type containing:
+            - total: Total number of questions
+            - time_correct: Number of time-accurate responses
+            - answer_correct: Number of answer-accurate responses
+            - time_accuracy: Time accuracy ratio (0.0-1.0)
+            - answer_accuracy: Answer accuracy ratio (0.0-1.0)
+        """
+        from collections import defaultdict
+        
+        stats = defaultdict(lambda: defaultdict(int))
+        total = 0
+        
+        for entry in data:
+            questions_list = entry.get("questions", [])
+            if not questions_list and isinstance(entry, list):
+                questions_list = entry
+                
+            for question in questions_list:
+                # Find model key
+                model_key = model if model in question else None
+                if not model_key:
+                    for k in question.keys():
+                        if k.lower() == model.lower():
+                            model_key = k
+                            break
+                
+                if not model_key:
+                    continue
+
+                if "ground_truth_time_stamp" not in question:
+                    continue
+
+                ground_truth_timestamp = question["ground_truth_time_stamp"]
+
+                try:
+                    ground_truth_time = sum(int(x) * 60 ** i for i, x in enumerate(reversed(ground_truth_timestamp.split(":"))))
+                except:
+                    continue
+
+                task_type = "Proactive Output"
+                model_answer = question.get(model_key, None)
+                
+                if not model_answer or "dialog_history" not in model_answer:
+                    continue
+
+                history = model_answer["dialog_history"]
+                if not history:
+                    continue
+                    
+                last_time = history[-1]["time"]
+                last_answer = history[-1]["content"]  
+
+                total += 1
+                stats[f'{task_type}']["total"] += 1
+                
+                if -po_thd <= last_time - ground_truth_time <= po_thd:
+                    stats[f'{task_type}']["time_correct"] += 1
+                    if "ground_truth_output" in question and question["ground_truth_output"] in last_answer:
+                        stats[f'{task_type}']["answer_correct"] += 1
+        
+        # Calculate accuracy ratios
+        for task_type, counts in stats.items():
+            counts["time_accuracy"] = counts["time_correct"] / counts["total"] if counts["total"] > 0 else 0
+            counts["answer_accuracy"] = counts["answer_correct"] / counts["total"] if counts["total"] > 0 else 0
+        
+        return dict(stats)
+
+    @staticmethod
+    def update_task_metrics(metrics: ScenarioMetrics, task_state: dict[str, dict[str, int | float]]) -> None:
+        """
+        Update proactive task metrics in the ScenarioMetrics object.
+        """
+        if not task_state:
+            return
+        
+        task_type = "Proactive Output"
+        stats = task_state.get(task_type, {})
+        metrics.task_total = stats.get("total", 0)
+        metrics.task_time_correct = stats.get("time_correct", 0)
+        metrics.task_answer_correct = stats.get("answer_correct", 0)
+        metrics.task_time_accuracy = stats.get("time_accuracy", 0.0)
+        metrics.task_answer_accuracy = stats.get("answer_accuracy", 0.0)
+       
+
+    @staticmethod
     def _percentile(values: list[float], p: int) -> float:
         """Calculate percentile value."""
         if not values:
@@ -555,5 +692,12 @@ class MetricsCalculator:
                 "off_gap_mean_ms": (metrics.burst_off_gap_mean_sec or 0) * 1000,
                 "on_gap_count": metrics.burst_on_gap_count,
                 "off_gap_count": metrics.burst_off_gap_count,
+            },
+            "task_accuracy": {
+                "total": metrics.task_total,
+                "time_correct": metrics.task_time_correct,
+                "answer_correct": metrics.task_answer_correct,
+                "time_accuracy": metrics.task_time_accuracy,
+                "answer_accuracy": metrics.task_answer_accuracy,
             }
         }

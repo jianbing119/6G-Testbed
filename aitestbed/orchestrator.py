@@ -7,6 +7,7 @@ Coordinates scenario execution, network emulation, and data collection.
 
 import argparse
 import logging
+import colorlog
 import time
 import yaml
 import json
@@ -22,7 +23,7 @@ load_dotenv()  # Loads from .env in current directory
 load_dotenv(Path(__file__).parent / ".env")  # Also try aitestbed/.env
 load_dotenv(Path(__file__).parent.parent / ".env")  # Also try repo root .env
 
-from clients import OpenAIClient, GeminiClient, DeepSeekClient, VLLMClient, AzureOpenAIClient, AzureInferenceClient
+from clients import OpenAIClient, GeminiClient, DeepSeekClient, VLLMClient, AzureOpenAIClient, AzureInferenceClient, RealtimeWebRTCVLMClient, OpenAITokenClient
 from analysis import TrafficLogger, MetricsCalculator, LogRecord
 from netemu import NetworkEmulator
 from scenarios import (
@@ -45,14 +46,34 @@ from scenarios import (
     MusicResearchAgentScenario,
     PlaywrightAgentScenario,
     TradingAgentScenario,
+    RealtimeVideoUnderstandingScenario,
+    ChatTokenScenario
 )
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+# Configure logging
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter(
+    "%(asctime)s - %(name)s - %(log_color)s%(levelname)-8s%(reset)s - %(message)s",
+    log_colors={
+        'DEBUG':    'cyan',
+        'INFO':     'green',
+        'WARNING':  'yellow',
+        'ERROR':    'red',
+        'CRITICAL': 'red,bg_white',
+    }
+))
+logger = colorlog.getLogger("orchestrator")
+logger.addHandler(handler)
+# File log
+file_handler = logging.FileHandler('logs/orchestrator.log', mode='w', encoding='utf-8')
+file_formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)-8s - %(message)s"
 )
-logger = logging.getLogger("orchestrator")
+file_handler.setFormatter(file_formatter)
+logger.addHandler(file_handler)
+logger.setLevel(logging.INFO)
+
 
 
 class RunFailedError(Exception):
@@ -141,6 +162,11 @@ class TestbedOrchestrator:
             "realtime_conversation_webrtc": RealtimeWebRTCConversationScenario,
             "realtime_audio": RealtimeAudioScenario,
             "realtime_audio_webrtc": RealtimeAudioWebRTCScenario,
+            # Real-time video understanding scenario
+            "realtime_video_understanding": RealtimeVideoUnderstandingScenario,
+            # chat with token ID
+            "chat_token": ChatTokenScenario
+
         }
 
     # ------------------------------------------------------------------
@@ -295,6 +321,10 @@ class TestbedOrchestrator:
                 self._clients[provider] = AzureOpenAIClient()
             elif provider == "azure_inference":
                 self._clients[provider] = AzureInferenceClient()
+            elif provider == "vlm-local":
+                self._clients[provider] = RealtimeWebRTCVLMClient()
+            elif provider == "openai_token":
+                self._clients[provider] = OpenAITokenClient()
             else:
                 raise ValueError(f"Unknown provider: {provider}")
         return self._clients[provider]
@@ -337,7 +367,7 @@ class TestbedOrchestrator:
         scenario_name: str,
         profile_name: str,
         runs: int = 10,
-        inter_run_delay: float = 1.0,
+        inter_run_delay: float = 5.0, 
         ingress_profile: Optional[str] = None,
         run_timeout: Optional[float] = None,
         stop_on_error: bool = False,
@@ -722,6 +752,27 @@ class TestbedOrchestrator:
                     )
                     all_metrics.append(metrics)
 
+                    # check if task accuracy be calculated
+                    scenario_config = self.scenarios_config["scenarios"].get(scenario_name, {})
+                    if scenario_config.get("type") == "realtime_video_understanding":
+                        try:
+                            task_config = scenario_config.get("task_config", {})
+                            model_name = scenario_config.get("model", "liquid")
+                            po_thd = task_config.get("po_thd", 3)
+                            results_dir = task_config.get("results_dir", "logs")
+
+                            data = MetricsCalculator.load_task_results(results_dir, profile_name)
+                            if data:
+                                task_stats = MetricsCalculator.calculate_task_accuracy(data, model_name, po_thd)
+                                MetricsCalculator.update_task_metrics(metrics, task_stats)
+                                logger.info(
+                                    f"task total = {metrics.task_total}"
+                                    f"time_accuracy = {metrics.task_time_accuracy}"
+                                    f"answer_accuracy = {metrics.task_time_accuracy}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Failed to calculate task accuracy: {e}")
+
                     logger.info(f"Metrics: latency_mean={metrics.latency_mean:.3f}s, "
                                f"success_rate={metrics.success_rate:.1f}%")
 
@@ -1087,6 +1138,30 @@ def main():
                 burst_gap_sec=metrics_defaults.get("burst_gap_sec"),
             )
 
+            # check if task accuracy be calculated
+            scenario_config = orchestrator.scenarios_config["scenarios"].get(args.scenario)
+            scenario_type = scenario_config.get("type", "chat")
+            if scenario_type == "realtime_video_understanding":
+                try:
+                    task_config = scenario_config.get("task_config", {})
+                    model_name = scenario_config.get("model", "liquid")
+                    po_thd = task_config.get("po_thd", 3)
+                    results_dir = task_config.get("results_dir", "logs")
+
+                    data = MetricsCalculator.load_task_results(results_dir, args.profile)
+                    if data:
+                        task_stats = MetricsCalculator.calculate_task_accuracy(data, model_name, po_thd)
+                        MetricsCalculator.update_task_metrics(metrics, task_stats)
+                        logger.info(
+                            f"task total = {metrics.task_total}, "
+                            f"time_accuracy = {metrics.task_time_accuracy}, "
+                            f"answer_accuracy = {metrics.task_time_accuracy}, "
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to calculate task accuracy: {e}")
+
+            orchestrator.generate_report([metrics], args.report)
+
             print("\n" + "="*60)
             print(f"Results for {args.scenario} with {args.profile}")
             print("="*60)
@@ -1097,6 +1172,9 @@ def main():
             print(f"  Request bytes:  {metrics.request_bytes_mean:.0f}")
             print(f"  Response bytes: {metrics.response_bytes_mean:.0f}")
             print(f"  UL/DL ratio:    {metrics.ul_dl_ratio_mean:.3f}")
+            if metrics.tokens_in_mean is not None and metrics.tokens_out_mean is not None:
+                print(f"  Tokens in:      {metrics.tokens_in_mean:.0f}")
+                print(f"  Tokens out:     {metrics.tokens_out_mean:.0f}")
             if metrics.ttft_p95 is not None:
                 print(f"  TTFT (p95):     {metrics.ttft_p95:.3f}s")
             if metrics.ttlt_p95 is not None:
@@ -1112,6 +1190,12 @@ def main():
                 print(f"  Loop factor:    {metrics.loop_factor:.1f}")
             if metrics.error_breakdown and any(metrics.error_breakdown.values()):
                 print(f"  Errors:         {metrics.error_breakdown}")
+            if metrics.task_total is not None:
+                print(f"  Task total:     {metrics.task_total}")
+            if metrics.task_time_accuracy is not None:
+                print(f"  Time accuracy:  {metrics.task_time_accuracy}")
+            if metrics.task_answer_accuracy is not None:
+                print(f"  Answer accuracy:{metrics.task_answer_accuracy}")
         else:
             parser.print_help()
     finally:
