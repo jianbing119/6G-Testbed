@@ -28,7 +28,7 @@ Realtime video analysis and chat with token ID scenarios are supported.
 - VLM_tokenizer: download vqgan.ckpt and vqgan.yaml, put them in aiortc-main-clean/src/aiortc/liquid/checkpoints/chameleon  
 https://huggingface.co/spaces/Junfeng5/Liquid_demo/resolve/main/chameleon/vqgan.ckpt  
 https://huggingface.co/spaces/Junfeng5/Liquid_demo/resolve/main/chameleon/vqgan.yaml  
-- VLM model: download all model files, put them in aiortc-main-clean/src/aiortc/liquid/checkpoints/chameleon  
+- VLM model: download all model files, put them in aiortc-main-clean/src/aiortc/liquid/checkpoints/model
 https://huggingface.co/Junfeng5/Liquid_V1_7B/tree/main  
 - dataset: download dataset, unzip to aitestbed/examples/assets/dataset  
 https://huggingface.co/datasets/mjuicem/StreamingBench/blob/main/Proactive%20Output_1-25.zip  

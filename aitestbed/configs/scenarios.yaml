@@ -428,7 +428,7 @@ scenarios:
     stream: true
     task_config:
       po_thd: 3
-      results_dirs: "examples/assets/dataset/"
+      results_dir: "examples/assets/dataset/"
     video_paths: "examples/assets/dataset/"
     prompts:
       - "What is in the video? Answer directly!"

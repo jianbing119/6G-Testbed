@@ -7,8 +7,8 @@ import json
 import sys
 import os
 import time
+from pathlib import Path
 from typing import Optional, Set, Any, Dict
-
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, MediaStreamError
 from aiortc.contrib.signaling import BYE
 from aiortc.codecs.tokenId import AsyncTokenIdDecoder
@@ -18,7 +18,6 @@ import aiortc.shared as shared
 # Logging Setup
 # ======================
 def setup_logger(name: str) -> logging.Logger:
-
     handler = colorlog.StreamHandler()
     handler.setFormatter(colorlog.ColoredFormatter(
         "%(asctime)s - %(name)s - %(log_color)s%(levelname)-8s%(reset)s - %(message)s",
@@ -33,6 +32,7 @@ def setup_logger(name: str) -> logging.Logger:
     logger = colorlog.getLogger(name)
     logger.addHandler(handler)
     # File log
+    Path('logs').mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler('logs/server.log', mode='w', encoding='utf-8')
     file_formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)-8s - %(message)s"

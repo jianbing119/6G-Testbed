@@ -66,6 +66,7 @@ handler.setFormatter(colorlog.ColoredFormatter(
 logger = colorlog.getLogger("orchestrator")
 logger.addHandler(handler)
 # File log
+Path('logs').mkdir(parents=True, exist_ok=True)
 file_handler = logging.FileHandler('logs/orchestrator.log', mode='w', encoding='utf-8')
 file_formatter = logging.Formatter(
     "%(asctime)s - %(name)s - %(levelname)-8s - %(message)s"
