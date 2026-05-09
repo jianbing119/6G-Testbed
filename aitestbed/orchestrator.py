@@ -769,7 +769,7 @@ class TestbedOrchestrator:
                                 logger.info(
                                     f"task total = {metrics.task_total}"
                                     f"time_accuracy = {metrics.task_time_accuracy}"
-                                    f"answer_accuracy = {metrics.task_time_accuracy}"
+                                    f"answer_accuracy = {metrics.task_answer_accuracy}"
                                 )
                         except Exception as e:
                             logger.warning(f"Failed to calculate task accuracy: {e}")
@@ -1156,7 +1156,7 @@ def main():
                         logger.info(
                             f"task total = {metrics.task_total}, "
                             f"time_accuracy = {metrics.task_time_accuracy}, "
-                            f"answer_accuracy = {metrics.task_time_accuracy}, "
+                            f"answer_accuracy = {metrics.task_answer_accuracy}, "
                         )
                 except Exception as e:
                     logger.warning(f"Failed to calculate task accuracy: {e}")
