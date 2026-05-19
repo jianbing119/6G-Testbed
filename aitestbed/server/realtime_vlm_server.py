@@ -134,7 +134,7 @@ class TcpSignalingServer:
         if not self._reader or not self._connected.is_set():
             raise ConnectionError("Not connected")
         try:
-            data = await asyncio.wait_for(self._reader.readuntil(b'\n'), timeout=2.0)
+            data = await asyncio.wait_for(self._reader.readuntil(b'\n'), timeout=5.0)
             parsed = json.loads(data.decode('utf8').strip())
             return self._dict_to_object(parsed)
         except asyncio.TimeoutError:
@@ -486,7 +486,7 @@ class Session:
         logger.info("[Answer] Waiting for offer from client...")
         while not (self.server_ref.stop_event.is_set() or self._session_stop_event.is_set()) and not self._is_clean_up:
             try:
-                obj = await asyncio.wait_for(self.signaling.receive(), timeout=2.0)
+                obj = await asyncio.wait_for(self.signaling.receive(), timeout=5.0)
             except asyncio.TimeoutError:
                 continue
             except ConnectionError as e:
@@ -516,6 +516,7 @@ class Session:
                 logger.info("[Server] Connection closed, saving benchmark results...")
                 self._close_session_reason = "connection failed"
                 logger.info("[Server] Connection closed, benchmark results saved!!!")
+                self._session_stop_event.set()
 
         logger.info("[Server] Entering ICE candidate exchange loop...")
         while not (self.server_ref.stop_event.is_set() or self._session_stop_event.is_set()) and not self._is_clean_up:

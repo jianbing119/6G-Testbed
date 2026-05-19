@@ -49,7 +49,7 @@ bash run_full_tests.sh --enable vllm --runs 30
 | **`--resume`** | **Skip already-completed combos, append to existing DB** | **Critical: use whenever a previous run was interrupted or a scenario failed. Implies `--no-clean`. See dedicated section below.** |
 | `--verbose, -v` | Show full log instead of progress bar | Debugging; default is a single progress bar |
 
-Phase names (for `--enable` / `--disable`): `chat, realtime, image, search, deepseek, gemini, music, trading, computer_use, playwright, multimodal, google_search, stress, vllm`.
+Phase names (for `--enable` / `--disable`): `chat, realtime, image, search, deepseek, gemini, music, trading, computer_use, playwright, multimodal, google_search, stress, vllm, realtime_video_understanding, chat_token`.
 
 ### `--resume`: recovering an interrupted run
 
@@ -163,6 +163,7 @@ The run ends with a summary banner showing duration, total records, success rate
 | `chat_deepseek_coder` | DeepSeek | deepseek-coder | Yes | Code-focused chat |
 | `chat_deepseek_reasoner` | DeepSeek | deepseek-reasoner | Yes | Deep reasoning chat (R1) |
 | `chat_vllm` | vLLM | Qwen3-VL-30B-A3B | Yes | Self-hosted model (loopback) |
+| `chat_token` | OpenAI-Compatible | Custom | Yes/No | Chat with Token ID transmission |
 
 ### Agentic AI (MCP Tool Calling)
 
@@ -195,6 +196,7 @@ The run ends with a summary banner showing duration, total records, success rate
 | `image_generation` | OpenAI | gpt-image-1.5 | DALL-E image generation |
 | `multimodal_analysis` | Gemini | gemini-3-flash-preview | Image + text analysis |
 | `video_understanding_vllm` | vLLM | Qwen3-VL-30B-A3B | Video understanding (loopback) |
+| `realtime_video_understanding` | VLM | Liquid_V1_7B | Realtime video analysis with token transmission |
 
 ### Realtime Conversational AI (OpenAI Realtime API)
 
@@ -234,6 +236,7 @@ The test matrix uses the 10 selected profiles from `configs/profiles.yaml`, alig
 | `congested` | 200 ms | 50 ms | pareto | 3% | Gilbert-Elliot (40%) | 1 Mbps | Bufferbloat / heavy congestion |
 | `5qi_7` | 80 ms | 10 ms | normal | 0.1% | correlated (20%) | -- | 5QI 7: Voice / Live Streaming (PDB 100 ms, PER 1e-3) |
 | `5qi_80` | 8 ms | 1 ms | normal | 1e-6 | correlated (5%) | -- | 5QI 80: Low-latency eMBB / AR (PDB 10 ms, PER 1e-6) |
+| `lossy` | 0 ms | 0 ms | fixed | 10% | -- | unlimited | High loss test |
 
 ⇄ Asymmetric profiles (`satellite_leo`, `satellite_geo`) use an optional `uplink:` sub-block that overrides egress-side fields only. The columns above show **downlink / uplink**; fields not listed under `uplink:` are inherited from the downlink block. 5QI anchors follow the S4-260848 rule `delay_ms = PDB − 2.054 × jitter_ms` when `jitter_ms > 0`.
 
@@ -371,6 +374,8 @@ All MCP servers support HTTP transport for traffic measurement via loopback (sub
 - Linux with `iproute2` (for network emulation)
 - `tcpdump` (for PCAP capture)
 - Sudo access or Docker with `NET_ADMIN`
+- NVIDIA GPU with ~ 30GB VRAM (for VLM models)
+- CUDA Toolkit >= 12.1
 
 ### Setup
 
@@ -381,6 +386,9 @@ source venv/bin/activate
 
 # Install netemu (sibling package)
 pip install -e netemu
+
+# Install aiortc extension (for VLM/RTP scenarios)
+pip install -e aiortc-main-clean
 
 # Install testbed dependencies
 pip install -r aitestbed/requirements.txt
@@ -402,9 +410,34 @@ export SPOTIFY_CLIENT_ID="..."          # Music agent scenarios
 export SPOTIFY_CLIENT_SECRET="..."      # Music agent scenarios
 export ALPACA_API_KEY="..."             # Trading scenarios
 export ALPACA_SECRET_KEY="..."          # Trading scenarios
+
+# For Chat with Token ID scenario
+export OPENAI_BASE_URL="http://..."     # OpenAI-compatible server URL
+export MODEL_NAME="..."                 # Model name
+export TOK_PATH="..." 			# Path to tokenizer files
 ```
 
 Or copy `.env.example` to `.env` and fill in values.
+
+### VLM & Token ID Scenario Assets
+
+For **Realtime Video Analysis** and **Chat with Token ID** scenarios, additional assets are required.
+
+**1. Realtime Video Analysis (`realtime_video_understanding`)**
+
+- **VLM Tokenizer:** Download `vqgan.ckpt` and `vqgan.yaml`, put them in `aiortc-main-clean/src/aiortc/liquid/checkpoints/chameleon`
+  - [vqgan.ckpt](https://huggingface.co/spaces/Junfeng5/Liquid_demo/resolve/main/chameleon/vqgan.ckpt)
+  - [vqgan.yaml](https://huggingface.co/spaces/Junfeng5/Liquid_demo/resolve/main/chameleon/vqgan.yaml)
+- **VLM Model:** Download all model files, put them in `aiortc-main-clean/src/aiortc/liquid/checkpoints/model`
+  - [Liquid_V1_7B](https://huggingface.co/Junfeng5/Liquid_V1_7B/tree/main)
+- **Dataset:** Download dataset, unzip to `aitestbed/examples/assets/dataset`
+  - [StreamingBench Dataset](https://huggingface.co/datasets/mjuicem/StreamingBench/blob/main/Proactive%20Output_1-25.zip)
+
+**2. Chat with Token ID (`chat_token`)**
+
+- Set up an OpenAI-compatible server with an open-source LLM.
+- Copy tokenizer related files to the path specified in `TOK_PATH`.
+- Configure `.env` file with `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `MODEL_NAME`, and `TOK_PATH`.
 
 ### Sudoers (for Network Emulation)
 
@@ -499,6 +532,54 @@ python orchestrator.py \
     --report results/reports/experiment_report.json
 ```
 
+### Running VLM & Token ID Scenarios
+
+**Realtime Video Analysis**
+
+```bash
+cd aitestbed
+# Start server first
+python ./server/realtime_vlm_server.py
+
+# Run test
+python orchestrator.py --scenario realtime_video_understanding --profile 5g_urban --runs 10
+
+# Run test with trace saved
+PROFILE=lossy
+python orchestrator.py \
+ --scenario realtime_video_understanding \
+ --profile $PROFILE \
+ --runs 20 \
+ --interface lo \
+ --capture-pcap \
+ --capture-dir results/captures/vlm/${PROFILE} \
+ --report results/reports/experiment_report_realtime_video_understanding_${PROFILE}.json \
+ --db logs/traffic_logs_vlm_${PROFILE}.db \
+ --egress-only
+```
+
+**Chat with Token ID**
+
+```bash
+# Start up OpenAI-compatible server (locally or remotely)
+# Edit .env file with OPENAI_BASE_URL, OPENAI_API_KEY, MODEL_NAME, TOK_PATH
+
+# Run test
+python orchestrator.py --scenario chat_token --profile 5g_urban --runs 10
+
+# Run test with trace saved
+PROFILE=lossy
+python orchestrator.py \
+ --scenario chat_token \
+ --profile $PROFILE \
+ --runs 10 \
+ --interface eno1 \ # Replace 'eno1' with actual interface
+ --capture-pcap \
+ --capture-dir results/captures/${PROFILE} \
+ --report results/reports/experiment_report_chat_token_${PROFILE}.json \
+ --db logs/traffic_logs${PROFILE}.db
+```
+
 ### Programmatic
 
 ```python
@@ -578,3 +659,6 @@ results/l7_captures:/app/results/l7_captures  # L7 HTTP logs
 - [OpenAI API](https://platform.openai.com/docs/api-reference)
 - [Google Gemini API](https://ai.google.dev/gemini-api/docs)
 - [Linux tc(8)](https://man7.org/linux/man-pages/man8/tc.8.html)
+- [aiortc](https://github.com/aiortc/aiortc/tree/main)
+- [Liquid Model](https://github.com/FoundationVision/Liquid)
+- [Streaming Bench](https://github.com/THUNLP-MT/StreamingBench/tree/main)

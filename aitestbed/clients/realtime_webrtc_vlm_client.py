@@ -249,12 +249,14 @@ class TcpSignalingClient:
     async def send(self, obj):
         if not self._writer:
             raise ConnectionError("Not connected")
-        data = signaling_object_to_dict(obj)
-        # print("[Signaling] send: ", data)
-        message = json.dumps(data) + '\n'
-        self._writer.write(message.encode('utf8'))
-        await self._writer.drain()
-        return len(message.encode('utf8'))
+        try:
+            data = signaling_object_to_dict(obj)
+            message = json.dumps(data) + '\n'
+            self._writer.write(message.encode('utf8'))
+            await asyncio.wait_for(self._writer.drain(), timeout=5.0)
+            return len(message.encode('utf8'))
+        except asynocio.TimeoutError:
+            raise ConnectionError("Signaling send timeout")
 
     async def close(self):
         if self._writer:
@@ -426,17 +428,24 @@ class RealtimeWebRTCVLMClient:
         # ICE connection state callback
         @self.pc.on("connectionstatechange")
         async def on_connectionstatechange():
-            if self.pc.connectionState == "connected":
+            state = self.pc.connectionState
+            logger.info(f"[Client] Connection State: {state}")
+            if state == "connected":
                 self.session_metrics.t_webrtc_connected = time.time()
                 self._ice_connected = True
                 # print(f"ice state: {self._ice_connected}")
-            elif self.pc.connectionState in ["disconnected", "failed"]:
+            elif state in ["disconnected", "failed"]:
                 if self._bye_close_event.is_set():
                     logger.info("[Client] Connection closed by BYE")
                 else:
-                    logger.warning("[Client] Connection closed unexpectedly")
-            else:
-                pass
+                    logger.warning("[Client] Connection lost, attempting ICE restart...")
+                    try:
+                        offer = await self.pc.createOffer(iceRestart=True)
+                        await self.pc.setLocalDescription(offer)
+                        await self.signaling.send(RTCSessionDescription(type="offer", sdp=offer.sdp))
+                    except Exception as e:
+                        logger.error(f"[Client] ICE restart failed: {e}")
+                        self._bye_close_event.set()
 
         # Data Channel
         self.data_channel = self.pc.createDataChannel("vlm-results")
@@ -655,6 +664,10 @@ class RealtimeWebRTCVLMClient:
         while True:
             if self._bye_close_event.is_set():
                 logger.info("[Client] Shutdown event detected, stopping video sent")
+                break
+            if self.pc.connectionState in ["failed", "closed"]:
+                logger.warning(f"[Client] WebRTC Connection State: {self.pc.connectionState}, breaking loop")
+                self._bye_close_event.set()
                 break
             await asyncio.sleep(0.1)
             try:

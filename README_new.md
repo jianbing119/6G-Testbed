@@ -28,7 +28,7 @@ Realtime video analysis and chat with token ID scenarios are supported.
 - VLM_tokenizer: download vqgan.ckpt and vqgan.yaml, put them in aiortc-main-clean/src/aiortc/liquid/checkpoints/chameleon  
 https://huggingface.co/spaces/Junfeng5/Liquid_demo/resolve/main/chameleon/vqgan.ckpt  
 https://huggingface.co/spaces/Junfeng5/Liquid_demo/resolve/main/chameleon/vqgan.yaml  
-- VLM model: download all model files, put them in aiortc-main-clean/src/aiortc/liquid/checkpoints/model
+- VLM model: download all model files, put them in aiortc-main-clean/src/aiortc/liquid/checkpoints/model  
 https://huggingface.co/Junfeng5/Liquid_V1_7B/tree/main  
 - dataset: download dataset, unzip to aitestbed/examples/assets/dataset  
 https://huggingface.co/datasets/mjuicem/StreamingBench/blob/main/Proactive%20Output_1-25.zip  
@@ -66,9 +66,19 @@ with NetworkEmulator(interface="eth0") as emu:
 
 ```bash
 # From the repo root:
+# if you prefer pip to manage python package
+python3 -m venv venv
+source venv/bin/activate
 pip install -e netemu
 pip install -e aiortc-main-clean
-pip install -r aitestbed/requirements.txt # do not contain aiortc
+pip install --use-deprecated=legacy-resolver -r aitestbed/requirements.txt # do not contain aiortc
+
+# or you can use uv
+uv venv
+source .venv/bin/activate
+uv pip install -e netemu
+uv pip install -e aiortc-main-clean
+uv pip install -r aitestbed/requirements.txt # do not contain aiortc
 
 # for realtime video analysis scenario
 cd aitestbed
@@ -77,7 +87,7 @@ python ./server/realtime_vlm_server.py
 # run test
 python orchestrator.py --scenario realtime_video_understanding --profile 5g_urban --runs 10
 # run test with trace saved
-PROFILE = lossy
+PROFILE=lossy
 python orchestrator.py \
     --scenario realtime_video_understanding \
     --profile $PROFILE \
@@ -95,7 +105,7 @@ python orchestrator.py \
 # run test
 python orchestrator.py --scenario chat_token --profile 5g_urban --runs 10
 # run test with trace saved
-PROFILE = lossy
+PROFILE=lossy
 python orchestrator.py \
     --scenario chat_token \
     --profile $PROFILE \
@@ -117,6 +127,7 @@ python orchestrator.py \
 | `wifi_good` | 30ms | 0.1% | 50 Mbps | Home WiFi |
 | `cell_edge` | 120ms | 1% | 5 Mbps | Poor coverage |
 | `satellite` | 600ms | 0.5% | 10 Mbps | LEO satellite |
+| `lossy`     | 0ms | 10% | unlimited | High loss test |
 
 
 ## Requirements
@@ -124,6 +135,8 @@ python orchestrator.py \
 - Python 3.10+
 - Linux with `iproute2` (for network emulation)
 - Sudo access or Docker with `NET_ADMIN` capability
+- NVIDIA GPU with ~30GB VRAM
+- CUDA Toolkit >= 12.1
 
 ## Sudoers (for Network Emulation)
 ```bash
